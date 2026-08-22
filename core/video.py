@@ -36,7 +36,9 @@ class VideoMixin:
         )
         return any(marker in text for marker in markers)
 
-    async def _watch_video_and_save_memory(self, video_id, memory_source="tool_watch"):
+    async def _watch_video_and_save_memory(
+        self, video_id, memory_source="tool_watch", *, force_rewatch=False
+    ):
         """完整分析一个 BV/av 视频并写入统一视频记忆，供工具和私信共用。"""
         raw_id = str(video_id or "").strip()
         if not raw_id:
@@ -69,24 +71,53 @@ class VideoMixin:
             }
 
             video_cache = self._load_json(VIDEO_MEMORY_FILE, {})
-            if self._compact_video_cache(video_cache):
-                self._save_json(VIDEO_MEMORY_FILE, video_cache)
             cached = video_cache.get(actual_bvid, {})
-            cached_analysis = str(cached.get("analysis", "") or "").strip()
-            if self._analysis_has_subtitle_mismatch(cached_analysis):
+            cached_text = str(cached.get("analysis") or cached.get("summary") or "").strip()
+            removed_bad_cache = False
+            if self._analysis_has_subtitle_mismatch(cached_text):
                 logger.warning(
                     f"[BiliBot] 丢弃疑似字幕错配的旧视频缓存，重新分析: {actual_bvid}"
                 )
-                cached_analysis = ""
+                video_cache.pop(actual_bvid, None)
+                cached = {}
+                removed_bad_cache = True
+            if self._compact_video_cache(video_cache) or removed_bad_cache:
+                self._save_json(VIDEO_MEMORY_FILE, video_cache)
+            cached = video_cache.get(actual_bvid, {})
+            cached_analysis = str(cached.get("analysis", "") or "").strip()
             cached_summary = str(cached.get("summary", "") or "").strip()
-            if cached_analysis or cached_summary:
+            if (cached_analysis or cached_summary) and not force_rewatch:
                 video_description = self._clip_media_text(cached_analysis or cached_summary, 1600)
                 score = cached.get("score", 5)
                 mood = cached.get("mood", "平静")
                 review = self._clip_media_text(cached.get("review", "") or "完整分析已清理，仅保留简短摘要", 320)
                 from_cache = True
+                await self._mark_video_seen(
+                    actual_bvid, analysis_info, source=memory_source, increment=False
+                )
                 logger.info(f"[BiliBot] 📹 私信看片命中视频短期缓存/摘要索引：《{vi.get('title', '')}》")
             else:
+                seen_trace = await self._seen_video_record(actual_bvid)
+                if seen_trace and not force_rewatch:
+                    link = f"https://www.bilibili.com/video/{actual_bvid}"
+                    title = vi.get("title", "") or seen_trace.get("title", "")
+                    owner_name = vi.get("owner_name", "") or seen_trace.get("owner_name", "")
+                    message = (
+                        "[曾经看过这个视频]\n"
+                        f"标题：{title}\nUP主：{owner_name}\n链接：{link}\n"
+                        "详细内容已经淡忘了。为了避免把旧视频重新当成新视频分析，"
+                        "只有主人明确要求“重新看一次”时才会重看。"
+                    )
+                    share_info = dict(vi)
+                    share_info.update({"bvid": actual_bvid, "aid": oid, "oid": oid})
+                    return {
+                        "ok": True,
+                        "message": message,
+                        "video_info": share_info,
+                        "bvid": actual_bvid,
+                        "from_cache": True,
+                        "seen_only": True,
+                    }
                 logger.info(f"[BiliBot] 🎬 开始观看私信分享视频：《{vi.get('title', '')}》")
                 video_description = self._clip_media_text(
                     await self._analyze_video_with_vision(analysis_info), 1600
@@ -95,8 +126,11 @@ class VideoMixin:
                     analysis_info, video_description
                 )
                 score = (evaluation or {}).get("score", 5)
+                score_reason = str((evaluation or {}).get("score_reason", ""))
                 mood = (evaluation or {}).get("mood", "平静")
                 review = self._clip_media_text((evaluation or {}).get("review", ""), 320)
+                preference_signals = list((evaluation or {}).get("preference_signals", []) or [])
+                search_keywords = list((evaluation or {}).get("search_keywords", []) or [])
                 from_cache = False
 
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -110,21 +144,33 @@ class VideoMixin:
                     "analysis": video_description,
                     "summary": self._clip_media_text(video_description, 220),
                     "score": score,
+                    "score_reason": score_reason,
                     "mood": mood,
                     "review": review,
+                    "preference_signals": preference_signals,
+                    "search_keywords": search_keywords,
                     "time": now_str,
                     "source": memory_source,
                 }
                 self._save_json(VIDEO_MEMORY_FILE, video_cache)
+                await self._mark_video_seen(
+                    actual_bvid, analysis_info, source=memory_source
+                )
 
-                if self.config.get("ENABLE_VIDEO_LONG_TERM_MEMORY", False):
+                if self.config.get("ENABLE_VIDEO_LONG_TERM_MEMORY", True):
                     memory_text = (
                         f"[{now_str}] 视频摘要《{vi.get('title', '')}》"
-                        f"(UP主:{vi.get('owner_name', '')}) 感想:{review[:80]} 内容:{video_description[:220]}"
+                        f"(UP主:{vi.get('owner_name', '')}) 评分:{score}/10 "
+                        f"理由:{score_reason[:80]} 感想:{review[:80]} 内容:{video_description[:220]}"
                     )
+                    if preference_signals:
+                        memory_text += " 兴趣信号:" + "、".join(
+                            f"{item.get('polarity')}:{item.get('value')}"
+                            for item in preference_signals[:5]
+                        )
                     await self._save_self_memory_record(
-                        f"{memory_source}:{actual_bvid}", memory_text, memory_type="video",
-                        extra={"bvid": actual_bvid, "owner_mid": str(vi.get("owner_mid", "")), "owner_name": vi.get("owner_name", ""), "video_title": vi.get("title", ""), "tname": vi.get("tname", "")},
+                        f"{memory_source}:{actual_bvid}", self._clip_media_text(memory_text, 520), memory_type="video",
+                        extra={"bvid": actual_bvid, "owner_mid": str(vi.get("owner_mid", "")), "owner_name": vi.get("owner_name", ""), "video_title": vi.get("title", ""), "tname": (evaluation or {}).get("partition") or vi.get("tname", ""), "score": score, "score_reason": score_reason, "mood": mood, "review": review, "preference_signals": preference_signals, "search_keywords": search_keywords},
                     )
                 logger.info(f"[BiliBot] ✅ 私信分享视频已看完并写入短期缓存：{actual_bvid}")
 
@@ -264,29 +310,87 @@ class VideoMixin:
             logger.info("[BiliBot] 🔗 视觉+字幕+热评联合整合完成")
         return self._clip_media_text(result, 1600) if result else None
 
-    def _video_cache_ttl_seconds(self):
+    def _video_memory_windows_seconds(self):
         try:
-            return max(300, min(86400, int(self.config.get("VIDEO_CACHE_TTL_MINUTES", 30) or 30) * 60))
+            detail_days = max(
+                1,
+                min(60, int(self.config.get("VIDEO_MEMORY_DETAIL_DAYS", 15) or 15)),
+            )
         except (TypeError, ValueError):
-            return 1800
+            detail_days = 15
+        try:
+            fade_days = max(
+                30,
+                min(730, int(self.config.get("VIDEO_MEMORY_FADE_DAYS", 90) or 90)),
+            )
+        except (TypeError, ValueError):
+            fade_days = 90
+        fade_days = max(detail_days, fade_days)
+        return detail_days * 86400, fade_days * 86400
+
+    def _video_cache_ttl_seconds(self):
+        """Backward-compatible name for the detailed-memory window."""
+        return self._video_memory_windows_seconds()[0]
 
     def _compact_video_cache(self, cache):
-        """Expire detailed analyses while retaining a tiny no-rewatch index."""
+        """Apply detail → long-term → faded lifecycle to the no-rewatch index."""
         now = datetime.now()
+        detail_seconds, fade_seconds = self._video_memory_windows_seconds()
         changed = False
         for bvid, item in list(cache.items()):
             if not isinstance(item, dict):
                 cache.pop(bvid, None); changed = True; continue
             try:
                 created = datetime.strptime(str(item.get("time", "")), "%Y-%m-%d %H:%M")
-                expired = (now - created).total_seconds() > self._video_cache_ttl_seconds()
+                age_seconds = max(0.0, (now - created).total_seconds())
             except (TypeError, ValueError):
-                expired = True
-            if expired and item.get("analysis"):
-                item["summary"] = self._clip_media_text(item.get("analysis", ""), 220)
-                item.pop("analysis", None)
-                item.pop("review", None)
-                item["expired_at"] = now.strftime("%Y-%m-%d %H:%M")
+                age_seconds = fade_seconds + 1
+
+            if age_seconds >= fade_seconds:
+                trace = (
+                    item.get("summary")
+                    or item.get("analysis")
+                    or item.get("desc")
+                    or "曾经看过，具体内容已经淡忘。"
+                )
+                faded_summary = self._clip_media_text(trace, 120)
+                keep = {
+                    "bvid": str(item.get("bvid") or bvid),
+                    "title": str(item.get("title") or ""),
+                    "owner_name": str(item.get("owner_name") or ""),
+                    "owner_mid": str(item.get("owner_mid") or ""),
+                    "tname": str(item.get("tname") or ""),
+                    "summary": faded_summary,
+                    "time": str(item.get("time") or ""),
+                    "source": str(item.get("source") or ""),
+                    "memory_stage": "faded",
+                    "faded_at": str(
+                        item.get("faded_at") or now.strftime("%Y-%m-%d %H:%M")
+                    ),
+                }
+                if item != keep:
+                    cache[bvid] = keep
+                    changed = True
+                continue
+
+            if age_seconds >= detail_seconds:
+                trace = item.get("analysis") or item.get("summary") or item.get("desc") or ""
+                summary = self._clip_media_text(trace, 220)
+                if item.get("summary") != summary:
+                    item["summary"] = summary
+                    changed = True
+                for key in ("analysis", "review"):
+                    if key in item:
+                        item.pop(key, None)
+                        changed = True
+                if item.get("memory_stage") != "long_term":
+                    item["memory_stage"] = "long_term"
+                    changed = True
+                if "detail_expired_at" not in item:
+                    item["detail_expired_at"] = now.strftime("%Y-%m-%d %H:%M")
+                    changed = True
+            elif item.get("memory_stage") != "detail":
+                item["memory_stage"] = "detail"
                 changed = True
         return changed
 
@@ -520,8 +624,18 @@ UP主：{video_info.get('up_name', '未知')}
         formats = []
         for h in heights:
             formats.extend([
-                f"best[ext=mp4][vcodec!=none][acodec!=none][height<={h}]/best[height<={h}][vcodec!=none][acodec!=none]",
-                f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]/bestvideo[height<={h}]+bestaudio/best[height<={h}]",
+                # 横屏视频的短边通常是 height，竖屏视频的短边则是 width。
+                # 两种方向都纳入同一档回退，避免 360x640 这类竖屏视频
+                # 因 height>360 被误判为“没有 360p 格式”。
+                f"best[ext=mp4][vcodec!=none][acodec!=none][height<={h}]/"
+                f"best[ext=mp4][vcodec!=none][acodec!=none][width<={h}]/"
+                f"best[height<={h}][vcodec!=none][acodec!=none]/"
+                f"best[width<={h}][vcodec!=none][acodec!=none]",
+                f"bestvideo[ext=mp4][height<={h}]+bestaudio[ext=m4a]/"
+                f"bestvideo[ext=mp4][width<={h}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={h}]+bestaudio/"
+                f"bestvideo[width<={h}]+bestaudio/"
+                f"best[height<={h}]/best[width<={h}]",
             ])
         formats.extend([
             "bestvideo+bestaudio/best",
@@ -753,14 +867,21 @@ UP主：{video_info.get('up_name', '未知')}
             return "", None
         if bvid in vc:
             c = vc[bvid]
-            if self._analysis_has_subtitle_mismatch(c.get("analysis", "")):
+            if self._analysis_has_subtitle_mismatch(c.get("analysis") or c.get("summary", "")):
                 logger.warning(f"[BiliBot] 评论上下文丢弃字幕错配缓存: {bvid}")
                 vc.pop(bvid, None)
                 self._save_json(VIDEO_MEMORY_FILE, vc)
             else:
+                await self._mark_video_seen(
+                    bvid, c, source="comment_video_context", increment=False
+                )
                 has_mem = any(m.get("bvid") == bvid or m.get("thread_id") == f"video:{bvid}" for m in self._memory)
                 cached_summary = c.get("analysis") or c.get("summary") or "已看过该视频；完整分析缓存已清理。"
-                if not has_mem and self.config.get("ENABLE_VIDEO_LONG_TERM_MEMORY", False):
+                if (
+                    not has_mem
+                    and self.config.get("ENABLE_VIDEO_LONG_TERM_MEMORY", True)
+                    and c.get("memory_stage") != "faded"
+                ):
                     mem_time = c.get("time", datetime.now().strftime("%Y-%m-%d %H:%M"))
                     memory_text = (
                         f"[{mem_time}] 视频摘要：标题《{c.get('title', '')}》 "
@@ -768,7 +889,7 @@ UP主：{video_info.get('up_name', '未知')}
                     )
                     await self._save_self_memory_record(
                         f"video:{bvid}", memory_text, memory_type="video",
-                        extra={"bvid": bvid, "owner_mid": str(c.get("owner_mid", "")), "owner_name": c.get("owner_name", ""), "video_title": c.get("title", "")},
+                        extra={"bvid": bvid, "owner_mid": str(c.get("owner_mid", "")), "owner_name": c.get("owner_name", ""), "video_title": c.get("title", ""), "time": mem_time},
                     )
                 ctx = f"【当前视频】\n标题：{c.get('title', '')}\nUP主：{c.get('owner_name', '')}（UID:{c.get('owner_mid', '')}）\n分区：{c.get('tname', '')}\n简介：{c.get('desc', '')[:150]}\n内容概括：{self._clip_media_text(cached_summary, 240)}"
                 tags = await self._get_video_tags(bvid)
@@ -781,6 +902,15 @@ UP主：{video_info.get('up_name', '未知')}
         vi = await self._get_video_info(oid)
         if not vi:
             return "", None
+        seen_trace = await self._seen_video_record(bvid)
+        if seen_trace:
+            ctx = (
+                f"【当前视频·曾经看过】\n标题：{vi['title']}\n"
+                f"UP主：{vi['owner_name']}（UID:{vi['owner_mid']}）\n"
+                f"分区：{vi['tname']}\n简介：{vi.get('desc', '')[:150]}\n"
+                "观看细节已经淡忘；本次不会自动重新下载分析。"
+            )
+            return ctx, seen_trace
         logger.info(f"[BiliBot] 📹 新视频，分析中：《{vi['title']}》by {vi['owner_name']}")
         analysis = self._clip_media_text(await self._analyze_video_with_vision(vi), 1600)
         logger.info(f"[BiliBot] 📹 分析结果：{analysis[:60]}...")
@@ -788,15 +918,19 @@ UP主：{video_info.get('up_name', '未知')}
         cache_entry = {"bvid": bvid, "title": vi["title"], "desc": vi.get("desc", "")[:200], "owner_name": vi["owner_name"], "owner_mid": str(vi["owner_mid"]), "tname": vi["tname"], "analysis": analysis, "summary": self._clip_media_text(analysis, 220), "time": analyzed_at}
         vc[bvid] = cache_entry
         self._save_json(VIDEO_MEMORY_FILE, vc)
+        await self._mark_video_seen(
+            bvid, cache_entry, source="comment_video_context"
+        )
         memory_text = (
             f"[{analyzed_at}] 视频分析记忆：标题《{vi['title']}》 "
             f"UP主:{vi['owner_name']} 分区:{vi['tname']} "
             f"简介:{vi.get('desc', '')[:120]} 内容概括:{analysis[:200]}"
         )
-        await self._save_self_memory_record(
-            f"video:{bvid}", memory_text, memory_type="video",
-            extra={"bvid": bvid, "owner_mid": str(vi["owner_mid"]), "owner_name": vi.get("owner_name", ""), "video_title": vi["title"]},
-        )
+        if self.config.get("ENABLE_VIDEO_LONG_TERM_MEMORY", True):
+            await self._save_self_memory_record(
+                f"video:{bvid}", memory_text, memory_type="video",
+                extra={"bvid": bvid, "owner_mid": str(vi["owner_mid"]), "owner_name": vi.get("owner_name", ""), "video_title": vi["title"]},
+            )
         ctx = f"【当前视频】\n标题：{vi['title']}\nUP主：{vi['owner_name']}（UID:{vi['owner_mid']}）\n分区：{vi['tname']}\n简介：{vi.get('desc', '')[:150]}\n内容概括：{analysis}"
         tags = await self._get_video_tags(bvid)
         comments = await self._get_hot_comments(oid)

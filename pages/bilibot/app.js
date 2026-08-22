@@ -2,6 +2,10 @@ import { icon } from "./icons.js";
 
 const bridge = window.AstrBotPluginPage || null;
 const isPreview = location.search.includes("preview=1") || !bridge;
+// ?ext=<id> boots straight into one extension with no host shell behind it, so the
+// workspace can be opened in its own tab and inspected without the sidebar in the
+// way.  Empty unless asked for, which keeps the embedded path unchanged.
+const standaloneExtensionId = new URLSearchParams(location.search).get("ext") || "";
 const app = document.querySelector("#app");
 const content = document.querySelector("#content");
 const sidebar = document.querySelector("#sidebar");
@@ -22,6 +26,9 @@ const brandLogoUrl = pageAssetUrl("./assets/logo.png");
 
 const state = {
   currentPage: "overview",
+  // True when booted via ?ext=<id>: there is no host shell to go back to, so the
+  // return control is left out rather than rendered and dead.
+  standalone: false,
   schema: {},
   config: {},
   draft: {},
@@ -37,6 +44,7 @@ const state = {
   scheduleStats: {},
   memory: {},
   profiles: [],
+  interest: {},
   security: {},
   cache: {},
   availableTools: [],
@@ -48,6 +56,13 @@ const state = {
   qrPollTimer: null,
   pageToken: 0,
   isSaving: false,
+  mode: "host",
+  hostPage: "overview",
+  extensions: [],
+  activeExtensionId: null,
+  extensionPage: "dashboard",
+  extensionSchema: null,
+  extensionLoading: false,
 };
 
 const NAV_ITEMS = [
@@ -66,11 +81,11 @@ const PAGE_KEYS = {
     "ENABLE_SIMILAR_SKIP", "REPLY_SIMILARITY_PERCENT", "CUSTOM_REPLY_INSTRUCTION",
     "ENABLE_INTEREST_BASED_REPLY", "INTEREST_SELECTION_PROMPT", "FILTER_LOW_VALUE_MESSAGES",
     "FILTER_DUPLICATE_MESSAGES", "FILTER_AD_MESSAGES", "INTEREST_APPLY_TO_PRIVATE",
-    "ENABLE_PRIVATE_MESSAGES", "PRIVATE_MESSAGE_REPLY_SCOPE", "PRIVATE_MESSAGE_AUTO_REPLY",
-    "PRIVATE_MESSAGE_AUTO_WATCH_VIDEO", "PRIVATE_MESSAGE_BILI_SEARCH_ENABLED", "PRIVATE_MESSAGE_BILI_SEARCH_LIMIT",
-    "BILI_PRIVATE_SHARE_TOOL_ENABLED", "BILI_PRIVATE_SHARE_COOLDOWN", "PRIVATE_MESSAGE_POLL_INTERVAL",
-    "PRIVATE_MESSAGE_IDLE_POLL_INTERVAL", "PRIVATE_MESSAGE_ACTIVE_WINDOW", "PRIVATE_MESSAGE_REPLY_WHITELIST_UIDS",
-    "CUSTOM_PRIVATE_MESSAGE_INSTRUCTION", "PRIVATE_MESSAGE_MAX_PER_POLL", "PRIVATE_MESSAGE_MAX_MESSAGE_AGE",
+    "ENABLE_PRIVATE_MESSAGES", "PRIVATE_MESSAGE_REPLY_SCOPE", "PRIVATE_MESSAGE_REPLY_WHITELIST_UIDS",
+    "PRIVATE_MESSAGE_AUTO_REPLY", "CUSTOM_PRIVATE_MESSAGE_INSTRUCTION", "PRIVATE_MESSAGE_POLL_INTERVAL",
+    "PRIVATE_MESSAGE_IDLE_POLL_INTERVAL", "PRIVATE_MESSAGE_ACTIVE_WINDOW", "PRIVATE_MESSAGE_MAX_PER_POLL",
+    "PRIVATE_MESSAGE_MAX_MESSAGE_AGE", "PRIVATE_MESSAGE_AUTO_WATCH_VIDEO", "PRIVATE_MESSAGE_BILI_SEARCH_ENABLED",
+    "PRIVATE_MESSAGE_BILI_SEARCH_LIMIT", "BILI_PRIVATE_SHARE_TOOL_ENABLED", "BILI_PRIVATE_SHARE_COOLDOWN",
     "ENABLE_LIVE_DANMAKU_REPLY", "LIVE_DANMAKU_ROOM_ID", "LIVE_DANMAKU_POLL_INTERVAL",
     "LIVE_DANMAKU_REPLY_COOLDOWN", "LIVE_DANMAKU_MAX_PER_MINUTE", "LIVE_DANMAKU_REPLY_MAX_LENGTH",
     "CUSTOM_LIVE_DANMAKU_INSTRUCTION", "ENABLE_BILI_SHARE_PARSE", "BILI_SHARE_PARSE_AUTO_TRIGGER_ENABLED",
@@ -80,24 +95,25 @@ const PAGE_KEYS = {
   ],
   autonomy: [
     "ENABLE_AUTONOMOUS_DAILY_PLAN", "AUTONOMOUS_ACTIVITY_LEVEL", "AUTONOMOUS_PLAN_PROMPT", "AUTONOMOUS_PLAN_GENERATION_MODE", "AUTONOMOUS_PLAN_AFTER_SLEEP_MINUTES", "AUTONOMOUS_PLAN_GENERATION_TIME", "AUTONOMOUS_PLAN_RETRY_MINUTES", "AUTONOMOUS_PROACTIVE_WINDOW_MINUTES",
-    "AUTONOMOUS_REPLY_DAILY_MIN", "AUTONOMOUS_REPLY_DAILY_MAX", "AUTONOMOUS_PRIVATE_DAILY_MIN", "AUTONOMOUS_PRIVATE_DAILY_MAX",
-    "AUTONOMOUS_DYNAMIC_DAILY_MIN", "AUTONOMOUS_DYNAMIC_DAILY_MAX", "AUTONOMOUS_PROACTIVE_DAILY_MIN", "AUTONOMOUS_PROACTIVE_DAILY_MAX",
+    "AUTONOMOUS_REPLY_DAILY_MAX", "AUTONOMOUS_PRIVATE_DAILY_MAX",
+    "AUTONOMOUS_DYNAMIC_DAILY_MAX", "AUTONOMOUS_PROACTIVE_DAILY_MAX",
     "AUTONOMOUS_MIN_ACTION_GAP_MINUTES", "SLEEP_START", "SLEEP_END",
+    "BEHAVIOR_BUDGET_ENABLED", "BEHAVIOR_GLOBAL_MAX_PER_MINUTE", "BEHAVIOR_GLOBAL_DAILY_LIMIT", "BEHAVIOR_ACTION_TIMEOUT_SECONDS",
     "ENABLE_PROACTIVE", "PROACTIVE_VIDEO_COUNT", "PROACTIVE_DAILY_LIMIT", "PROACTIVE_TIMES_COUNT",
-    "PROACTIVE_COMMENT_COUNT", "PROACTIVE_FOLLOW_UIDS", "PROACTIVE_SEARCH_QUERY_PROMPT", "PROACTIVE_TASTE_WINDOW_DAYS",
+    "PROACTIVE_COMMENT_COUNT", "PROACTIVE_COMMENT_DAILY_LIMIT", "PROACTIVE_FOLLOW_UIDS", "PROACTIVE_SEARCH_QUERY_PROMPT", "PROACTIVE_TASTE_WINDOW_DAYS",
     "PROACTIVE_VIDEO_POOLS", "ENABLE_PROACTIVE_LLM_PREFILTER", "PROACTIVE_LLM_PREFILTER_MAX_REJECTS",
     "PROACTIVE_LIKE", "PROACTIVE_LIKE_MIN_SCORE", "PROACTIVE_COIN", "PROACTIVE_COIN_MIN_SCORE",
     "PROACTIVE_FAV", "PROACTIVE_FAV_MIN_SCORE", "PROACTIVE_COMMENT", "PROACTIVE_COMMENT_MIN_SCORE",
     "PROACTIVE_FOLLOW", "PROACTIVE_FOLLOW_MIN_SCORE",
     "CUSTOM_PROACTIVE_INSTRUCTION", "ENABLE_OWNER_RECOMMEND", "RECOMMEND_OWNER_DELIVERY", "RECOMMEND_OWNER_MIN_SCORE",
-    "RECOMMEND_OWNER_DAILY_LIMIT", "CUSTOM_RECOMMEND_INSTRUCTION", "OWNER_QQ_UMO", "ENABLE_CROSS_PLATFORM_ACTIVITY_STATUS", "VIDEO_VISUAL_ANALYSIS_POLICY", "VIDEO_CACHE_TTL_MINUTES", "ENABLE_VIDEO_LONG_TERM_MEMORY", "SPECIAL_FOLLOW_ENABLED", "SPECIAL_FOLLOW_MODE",
+    "RECOMMEND_OWNER_DAILY_LIMIT", "CUSTOM_RECOMMEND_INSTRUCTION", "OWNER_QQ_UMO", "ENABLE_CROSS_PLATFORM_ACTIVITY_STATUS", "VIDEO_VISUAL_ANALYSIS_POLICY", "ENABLE_VIDEO_LONG_TERM_MEMORY", "VIDEO_MEMORY_DETAIL_DAYS", "VIDEO_MEMORY_FADE_DAYS", "SPECIAL_FOLLOW_ENABLED", "SPECIAL_FOLLOW_MODE",
     "SPECIAL_FOLLOW_TIMES_COUNT", "SPECIAL_FOLLOW_FIXED_TIMES", "ENABLE_BANGUMI", "BANGUMI_PROACTIVE",
     "BANGUMI_POOLS", "BANGUMI_EPISODE_COUNT", "BANGUMI_CONTINUE_SCORE", "BANGUMI_DAILY_LIMIT",
     "BANGUMI_COMMENT", "BANGUMI_AUTO_FOLLOW", "ENABLE_DYNAMIC", "DYNAMIC_TIMES_COUNT", "DYNAMIC_DAILY_COUNT",
     "DYNAMIC_TOPICS", "CUSTOM_DYNAMIC_INSTRUCTION",
     "ENABLE_DYNAMIC_WATCH", "DYNAMIC_WATCH_TIMES_COUNT", "DYNAMIC_WATCH_DAILY_LIMIT",
     "DYNAMIC_WATCH_SPECIAL_ONLY", "DYNAMIC_WATCH_INCLUDE_VIDEO_POSTS", "DYNAMIC_WATCH_INTEREST_PROMPT",
-    "FIXED_REPLY_DAILY_TARGET", "FIXED_PRIVATE_DAILY_TARGET", "FIXED_PROACTIVE_WINDOWS", "FIXED_PROACTIVE_TIMES",
+    "FIXED_PROACTIVE_WINDOWS", "FIXED_PROACTIVE_TIMES",
     "FIXED_DYNAMIC_TIMES", "FIXED_DYNAMIC_WATCH_TIMES", "FIXED_BANGUMI_TIMES", "FIXED_SPECIAL_FOLLOW_TIMES",
   ],
   memory: [
@@ -118,15 +134,15 @@ const PAGE_KEYS = {
 
 const SCHEDULE_REGEN_KEYS = new Set([
   "ENABLE_AUTONOMOUS_DAILY_PLAN", "AUTONOMOUS_ACTIVITY_LEVEL", "AUTONOMOUS_PLAN_PROMPT",
-  "AUTONOMOUS_REPLY_DAILY_MIN", "AUTONOMOUS_REPLY_DAILY_MAX", "AUTONOMOUS_PRIVATE_DAILY_MIN", "AUTONOMOUS_PRIVATE_DAILY_MAX",
-  "AUTONOMOUS_DYNAMIC_DAILY_MIN", "AUTONOMOUS_DYNAMIC_DAILY_MAX", "AUTONOMOUS_PROACTIVE_DAILY_MIN", "AUTONOMOUS_PROACTIVE_DAILY_MAX",
+  "AUTONOMOUS_REPLY_DAILY_MAX", "AUTONOMOUS_PRIVATE_DAILY_MAX",
+  "AUTONOMOUS_DYNAMIC_DAILY_MAX", "AUTONOMOUS_PROACTIVE_DAILY_MAX",
   "AUTONOMOUS_MIN_ACTION_GAP_MINUTES", "SLEEP_START", "SLEEP_END",
-  "ENABLE_PROACTIVE", "PROACTIVE_VIDEO_COUNT", "PROACTIVE_DAILY_LIMIT",
+  "ENABLE_PROACTIVE", "PROACTIVE_VIDEO_COUNT", "PROACTIVE_DAILY_LIMIT", "PROACTIVE_TIMES_COUNT",
   "ENABLE_DYNAMIC", "DYNAMIC_TIMES_COUNT", "DYNAMIC_DAILY_COUNT",
   "ENABLE_BANGUMI", "BANGUMI_PROACTIVE", "BANGUMI_DAILY_LIMIT",
   "SPECIAL_FOLLOW_ENABLED", "SPECIAL_FOLLOW_MODE", "SPECIAL_FOLLOW_TIMES_COUNT", "SPECIAL_FOLLOW_FIXED_TIMES",
   "ENABLE_DYNAMIC_WATCH", "DYNAMIC_WATCH_TIMES_COUNT", "DYNAMIC_WATCH_DAILY_LIMIT",
-  "FIXED_REPLY_DAILY_TARGET", "FIXED_PRIVATE_DAILY_TARGET", "FIXED_PROACTIVE_WINDOWS", "FIXED_PROACTIVE_TIMES",
+  "FIXED_PROACTIVE_WINDOWS", "FIXED_PROACTIVE_TIMES",
   "FIXED_DYNAMIC_TIMES", "FIXED_DYNAMIC_WATCH_TIMES", "FIXED_BANGUMI_TIMES", "FIXED_SPECIAL_FOLLOW_TIMES",
 ]);
 
@@ -155,17 +171,21 @@ const MOCK_FIELDS = {
   AUTONOMOUS_PLAN_GENERATION_MODE: ["【自主安排】每日计划生成时机", "string", "after_sleep", ["after_sleep", "fixed_time"]],
   AUTONOMOUS_PLAN_AFTER_SLEEP_MINUTES: ["【自主安排】休眠结束后生成计划的偏移（分钟）", "int", 5],
   AUTONOMOUS_PLAN_GENERATION_TIME: ["【自主安排】每日计划固定生成时刻", "string", "08:05"],
-  AUTONOMOUS_PLAN_RETRY_MINUTES: ["【自主安排】模型失败重试间隔（分钟）", "int", 15],
+  AUTONOMOUS_PLAN_RETRY_MINUTES: ["【自主安排】模型失败后唯一一次重试等待（分钟）", "int", 15],
   AUTONOMOUS_PROACTIVE_WINDOW_MINUTES: ["【自主安排】主动浏览默认时间段长度（分钟）", "int", 90],
-  AUTONOMOUS_REPLY_DAILY_MIN: ["【自主安排·范围】每日评论回复下限", "int", 0],
-  AUTONOMOUS_REPLY_DAILY_MAX: ["【自主安排·范围】每日评论回复上限", "int", 80],
-  AUTONOMOUS_PRIVATE_DAILY_MIN: ["【自主安排·范围】每日私信回复下限", "int", 0],
-  AUTONOMOUS_PRIVATE_DAILY_MAX: ["【自主安排·范围】每日私信回复上限", "int", 30],
-  AUTONOMOUS_DYNAMIC_DAILY_MIN: ["【自主安排·范围】每日发布动态下限", "int", 0],
-  AUTONOMOUS_DYNAMIC_DAILY_MAX: ["【自主安排·范围】每日发布动态上限", "int", 2],
-  AUTONOMOUS_PROACTIVE_DAILY_MIN: ["【自主安排·范围】每日主动行为下限", "int", 0],
-  AUTONOMOUS_PROACTIVE_DAILY_MAX: ["【自主安排·范围】每日主动行为上限", "int", 4],
+  AUTONOMOUS_REPLY_DAILY_MIN: ["【兼容旧配置】每日评论回复旧版下限（已停用）", "int", 0],
+  AUTONOMOUS_REPLY_DAILY_MAX: ["【自主安排·上限】每日评论回复最多几条", "int", 80],
+  AUTONOMOUS_PRIVATE_DAILY_MIN: ["【兼容旧配置】每日私信回复旧版下限（已停用）", "int", 0],
+  AUTONOMOUS_PRIVATE_DAILY_MAX: ["【自主安排·上限】每日私信回复最多几条", "int", 30],
+  AUTONOMOUS_DYNAMIC_DAILY_MIN: ["【兼容旧配置】每日动态旧版下限（已停用）", "int", 0],
+  AUTONOMOUS_DYNAMIC_DAILY_MAX: ["【自主安排·上限】每日发布动态最多几条", "int", 2],
+  AUTONOMOUS_PROACTIVE_DAILY_MIN: ["【兼容旧配置】每日主动浏览旧版下限（已停用）", "int", 0],
+  AUTONOMOUS_PROACTIVE_DAILY_MAX: ["【自主安排·上限】每日主动浏览轮次最多几轮", "int", 4],
   AUTONOMOUS_MIN_ACTION_GAP_MINUTES: ["【自主安排·硬约束】主动事件最小间隔（分钟）", "int", 45],
+  BEHAVIOR_BUDGET_ENABLED: ["【统一行为预算】启用全局频率与每日上限", "bool", true],
+  BEHAVIOR_GLOBAL_MAX_PER_MINUTE: ["【统一行为预算】每分钟最多执行动作数", "int", 8],
+  BEHAVIOR_GLOBAL_DAILY_LIMIT: ["【统一行为预算】每天最多执行动作数", "int", 200],
+  BEHAVIOR_ACTION_TIMEOUT_SECONDS: ["【统一行为预算】单个动作超时（秒）", "int", 45],
   SLEEP_START: ["【系统】休眠开始时间（0-23）", "int", 2],
   SLEEP_END: ["【系统】休眠结束时间（0-23）", "int", 8],
   ENABLE_PROACTIVE: ["【主动看片·总开关】启用主动看视频与互动", "bool", true],
@@ -173,6 +193,7 @@ const MOCK_FIELDS = {
   PROACTIVE_TIMES_COUNT: ["【主动看片·频率】每天触发几次主动浏览", "int", 2],
   PROACTIVE_VIDEO_COUNT: ["【主动看片·数量】每次计划观看几个视频", "int", 3],
   PROACTIVE_COMMENT_COUNT: ["【主动看片·互动】每个视频最多主动评论几条", "int", 1],
+  PROACTIVE_COMMENT_DAILY_LIMIT: ["【主动看片·互动】每天最多主动评论几条", "int", 2],
   PROACTIVE_FOLLOW_UIDS: ["【主动看片·来源】优先关注的 UP 主 UID", "list", ["184028", "902418"]],
   PROACTIVE_SEARCH_QUERY_PROMPT: ["【主动看片·搜索】搜索词生成提示词", "text", "结合今天的心情与长期兴趣，生成自然且不过度重复的搜索词。"],
   PROACTIVE_TASTE_WINDOW_DAYS: ["【主动看片·偏好】近期兴趣窗口（天）", "int", 14],
@@ -218,8 +239,8 @@ const MOCK_FIELDS = {
   DYNAMIC_WATCH_SPECIAL_ONLY: ["【关注动态巡视】只查看特别关注用户", "bool", false],
   DYNAMIC_WATCH_INCLUDE_VIDEO_POSTS: ["【关注动态巡视】同时查看视频投稿动态", "bool", true],
   DYNAMIC_WATCH_INTEREST_PROMPT: ["【关注动态巡视】兴趣判断补充提示词", "text", "挑选真正值得留意、适合之后与主人分享或形成个人记忆的动态。"],
-  FIXED_REPLY_DAILY_TARGET: ["【固定计划】每日评论回复目标数量", "int", 30],
-  FIXED_PRIVATE_DAILY_TARGET: ["【固定计划】每日私信回复目标数量", "int", 10],
+  FIXED_REPLY_DAILY_TARGET: ["【兼容旧配置】每日评论回复旧版目标（已停用）", "int", 30],
+  FIXED_PRIVATE_DAILY_TARGET: ["【兼容旧配置】每日私信回复旧版目标（已停用）", "int", 10],
   FIXED_PROACTIVE_WINDOWS: ["【固定计划】主动浏览时间段", "list", ["10:00-11:30", "19:00-21:00"]],
   FIXED_PROACTIVE_TIMES: ["【固定计划·兼容】主动浏览准确时刻", "list", ["10:30", "19:30"]],
   FIXED_DYNAMIC_TIMES: ["【固定计划】发布动态准确时刻", "list", ["18:30"]],
@@ -248,10 +269,12 @@ const MOCK_FIELDS = {
   OWNER_NAME: ["【账号】主人名称", "string", "主人"],
   OWNER_BILI_NAME: ["【账号】主人的B站昵称", "string", "示例昵称"],
   LLM_PROVIDER_ID: ["【人设】用于回复与记忆压缩的 LLM", "string", "default"],
+  LLM_CIRCUIT_FAILURE_THRESHOLD: ["【模型可靠性】连续失败多少次后暂停调用", "int", 5],
+  LLM_CIRCUIT_COOLDOWN_SECONDS: ["【模型可靠性】熔断冷却时间（秒）", "int", 120],
   USE_ASTRBOT_PERSONA: ["【人设】使用 AstrBot 自带人设", "bool", true],
   CUSTOM_SYSTEM_PROMPT: ["【人设】自定义系统提示词", "text", "自然、克制、有自己的兴趣和判断。"],
   ENABLE_LLM_TOOLS: ["【功能开关】启用 LLM 工具", "bool", true],
-  ENABLE_PERSONALITY_EVOLUTION: ["【功能开关】启用性格演化", "bool", true],
+  ENABLE_PERSONALITY_EVOLUTION: ["【实验性】启用旧版每日性格演化", "bool", false],
   EVOLVE_HOUR: ["【性格演化】触发时间（0-23点）", "int", 1],
   EMBED_MODEL: ["【高级·记忆】Embedding 模型名称", "string", "text-embedding-3-small"],
   VIDEO_VISION_PROVIDER_ID: ["【高级·视觉】视频分析模型提供商", "string", "default"],
@@ -297,11 +320,15 @@ function buildMock() {
     account: { logged_in: true, configured: true, name: "BiliBot 测试账号", uid: "10001", level: 6, reply_count: 47, comment_reply_count: 38, private_reply_count: 9, affection_total: 318, memory_count: 1248, running: true },
     schedule: {
       date: "2026-08-14", sleep_start: 2, sleep_end: 8, activity_level: 62, autonomous_enabled: true,
-      autonomous_plan: { rationale: "今天保持适度活跃，在晚间安排较有参与感的互动。", generated_at: "2026-08-14 08:02:11", reply_target: 50, private_target: 18 },
+      autonomous_plan: { rationale: "今天保持适度活跃，在晚间安排较有参与感的互动。", generated_at: "2026-08-14 08:02:11", reply_cap: 80, private_cap: 30 },
       events: previewEvents,
     },
     scheduleStats: { total: previewEvents.length, completed: previewCompleted, remaining: previewEvents.length - previewCompleted, next: previewNext, minimum_gap_minutes: 45 },
     memory: { total: 1248, comment: 876, private: 192, self: 180, isolation_mode: "isolated", safe_share: false },
+    interest: {
+      report: "🎯 BiliBot 视频兴趣\n━━━━━━━━━━━━\n统计窗口：最近7天｜看过18个｜有效评分10个｜待评价8个\n\n【近期分区口味】\n  暂无带分区的有效评分\n\n【近期 UP 样本】\n  · 乔西说宇宙：1个，平均8.0/10，样本较少\n  · 史蒂芬周大反派：1个，平均7.0/10，样本较少\n\n【近期具体兴趣信号】\n  暂无；新版会从之后完成的视频评价中逐步积累\n\n【已沉淀偏好】\n  尚未形成；单次观看不会直接写成稳定兴趣\n\n【最近探索方向】\n  深渊生物×3、古典舞 剑舞、老建筑 修复、废墟探索、舞蹈、深海生物纪录片\n\n说明：近期口味是观察样本；同一信号反复出现才会进入近期偏好，连续跨周后才会成为稳定偏好。",
+      updated_at: "2026-08-21 02:20:00", source: "runtime", cached: false, stale: false, read_only: true,
+    },
     profiles: [
       { name: "夏日汽水", user_id: "184028", affection: 82, relationship: "亲密", impression: "经常讨论动画与配乐", tags: ["动画", "配乐"], facts_count: 8, video_refs_count: 12, last_interaction: "2026-08-14 15:31" },
       { name: "蓝莓酱不加糖", user_id: "902418", affection: 61, relationship: "熟悉", impression: "喜欢分享有趣的知识视频", tags: ["科普"], facts_count: 5, video_refs_count: 7, last_interaction: "2026-08-13 20:06" },
@@ -328,6 +355,92 @@ function buildMock() {
 
 const mock = buildMock();
 
+function mockCreatorManifest() {
+  return {
+    type: "bilibot-extension", id: "preview-creator", name: "AI 创作中心", short_name: "Creator",
+    description: "从内容感知、灵感、创作到投稿复盘的一体化 AI UP 主工作台", version: "0.3.0",
+    extension_api: 1, enabled: true,
+    presentation: { mode: "immersive", accent: "#d7ff45", surface: "#080b12", switch_label: "进入 Creator", return_label: "返回 BiliBot", entry: "brand", entry_priority: 40 },
+    navigation: [
+      ["dashboard", "house", "创作总览", "灵感、项目和今日创作脉搏"],
+      ["ideas", "lightning", "信号与灵感", "热点、观看记录与选题候选"],
+      ["projects", "video", "项目宇宙", "脚本、分镜、素材和进度"],
+      ["studio", "controller", "创作工坊", "工作流、生成任务和预览"],
+      ["workspace", "folder", "素材空间", "容量、素材生命周期与安全清理"],
+      ["opportunities", "star", "投稿机会", "标签、活动与激励候选"],
+      ["insights", "trophy", "数据回声", "投稿表现、复盘和风格规则"],
+      ["governance", "shield", "权限与确认", "自动化策略、审批和 AI 提案"],
+      ["connections", "settings", "连接与能力", "Host、FFmpeg 与外部工具流"],
+    ].map(([page, iconName, title, description], index) => ({ page, icon: iconName, title, description, order: (index + 1) * 10 })),
+  };
+}
+
+const mockCreatorData = {
+  ideas: [
+    { id: "idea_01", title: "把深海探索热度变成 60 秒视觉短片", summary: "从未知感切入，用三段式叙事连接真实资料与生成画面。", source: "watching", format: "short", tags: ["深海", "科普", "短片"], trend_score: 86, channel_fit_score: 91, copyright_status: "review", status: "inbox" },
+    { id: "idea_02", title: "本周新番镜头语言观察", summary: "不是剧情复述，而是拆解三个让观众停留的镜头设计。", source: "bangumi", format: "essay", tags: ["番剧", "二创"], trend_score: 72, channel_fit_score: 84, copyright_status: "unknown", status: "inbox" },
+    { id: "idea_03", title: "旧建筑修复 ASMR 切片", summary: "保留材料声音与手部细节，减少旁白，建立舒缓风格实验。", source: "trend", format: "clip", tags: ["修复", "ASMR"], trend_score: 68, channel_fit_score: 77, copyright_status: "clear", status: "reviewing" },
+  ],
+  projects: [
+    { id: "project_01", title: "深海来信 / EP.01", description: "AI 影像与真实深海资料交叉的竖屏短片。", status: "producing", stage: "generation", progress: 58, content_type: "short", tags: ["AI短片", "深海"], updated_at: "刚刚" },
+    { id: "project_02", title: "镜头为什么让人停下来", description: "本周番剧镜头语言二创分析。", status: "planning", stage: "research", progress: 18, content_type: "essay", tags: ["番剧", "镜头"], updated_at: "12 分钟前" },
+    { id: "project_03", title: "修复声音样本集", description: "为后续 ASMR 系列建立声音和画面模板。", status: "reviewing", stage: "compliance", progress: 76, content_type: "clip", tags: ["ASMR"], updated_at: "昨天" },
+  ],
+  runs: [
+    { id: "run_01", project_id: "project_01", workflow: "short-video-foundation", status: "running", progress: 58, current_step: "生成转场与字幕节奏" },
+    { id: "run_02", project_id: "project_03", workflow: "audio-cleanup", status: "succeeded", progress: 100, current_step: "已生成预览" },
+  ],
+  connectors: [
+    { id: "builtin.ffmpeg", name: "FFmpeg Core", kind: "builtin", enabled: true, configured: true, state: "ready", capabilities: ["media.trim", "media.concat", "media.subtitle_burn"] },
+    { id: "builtin.storyboard", name: "Story Engine", kind: "builtin", enabled: true, configured: true, state: "ready", capabilities: ["script.plan", "storyboard.plan"] },
+    { id: "external.workflow", name: "External Workflow", kind: "remote", enabled: false, configured: false, state: "disabled", capabilities: ["video.generate", "template.render"] },
+  ],
+  signals: [
+    { id: "signal_01", source: "watch", title: "深海探索内容热度上升", summary: "连续观看信号显示深海、未知生物和沉浸式声音具有较高组合潜力。", tags: ["深海", "科普"], heat_score: 88, relevance_score: 92, state: "new" },
+    { id: "signal_02", source: "bangumi", title: "新番镜头语言讨论增长", summary: "适合做基于引用与分析的二创选题，需复核素材范围。", tags: ["番剧", "镜头"], heat_score: 73, relevance_score: 84, state: "reviewing" },
+  ],
+  assets: [
+    { id: "asset_01", project_id: "project_01", kind: "video", name: "deep-sea-proxy.mp4", path: "workspaces/project_01/proxy/deep-sea-proxy.mp4", size_bytes: 48234496, source: "owned", lifecycle: "active", copyright_status: "owned" },
+    { id: "asset_02", project_id: "project_01", kind: "cover", name: "cover-v3.webp", path: "assets/cover-v3.webp", size_bytes: 1835008, source: "generated", lifecycle: "active", copyright_status: "clear" },
+  ],
+  workspace: { root: ".creator-data", total_bytes: 734003200, total_label: "700 MB", files: 146, cleanup_bytes: 94371840, cleanup_label: "90 MB", buckets: { assets: { label: "素材库", bytes: 524288000, files: 82 }, workspaces: { label: "项目工作区", bytes: 157286400, files: 48 }, cache: { label: "缓存", bytes: 52428800, files: 16 } }, cleanup_candidates: [{ path: "cache/render-20260820.tmp", reason: "过期渲染缓存", size_bytes: 67108864 }, { path: "workspaces/project_01/proxy-old.mp4", reason: "旧代理文件", size_bytes: 27262976 }] },
+  opportunities: [
+    { id: "opp_01", kind: "tag", title: "AI 影像创作", summary: "来自公开标签观察，投稿前仍需人工核验有效性。", tags: ["AI", "短片"], source: "host-signal", confidence: .82 },
+    { id: "opp_02", kind: "activity", title: "竖屏创作候选活动", summary: "仅作为候选展示，当前没有自动报名 Provider。", tags: ["竖屏", "活动"], source: "manual-review", confidence: .61 },
+  ],
+  approvals: [
+    { id: "approval_01", stage: "publish", subject_id: "submission_01", title: "确认发布《深海来信》", state: "pending", risk: "high", requested_by: "creator", created_at: "2 分钟前" },
+    { id: "approval_02", stage: "workspace-cleanup", subject_id: "workspace", title: "清理 90 MB 临时素材", state: "approved", risk: "high", requested_by: "admin", created_at: "8 分钟前" },
+  ],
+  policies: { signal: "auto", idea: "ask", research: "auto", script: "ask", storyboard: "ask", asset: "manual", generation: "ask", editing: "ask", packaging: "ask", compliance: "manual", submission: "ask", upload: "manual", publish: "manual", analytics: "auto", retrospective: "ask", "opportunity-enroll": "manual", "workspace-cleanup": "manual" },
+  proposals: [{ id: "proposal_01", stage: "idea", title: "把深海系列改为三集实验", description: "先用同一视觉母题测试科普、情绪和 ASMR 三种叙事。", confidence: .78, state: "proposed" }],
+  submissions: [{ id: "submission_01", project_id: "project_01", title: "深海来信：60 秒潜入未知", state: "draft", tags: ["AI短片", "深海", "科普"] }],
+  analytics: [{ id: "analytics_01", project_id: "project_03", bvid: "BV1PREVIEW", horizon: "24h", views: 12840, likes: 960, comments: 126 }],
+  retrospectives: [{ id: "retro_01", project_id: "project_03", summary: "前 3 秒的材料声音能显著提高停留，下一期继续验证。" }],
+};
+
+function mockCreatorPage(pageId = "dashboard") {
+  const d = mockCreatorData;
+  const intro = (number, title, description, action = null) => ({ type: "creator-page-intro", number, title, description, ...(action ? { action } : {}) });
+  const pages = {
+    dashboard: { title: "把观看留下的火花，推进成真正发布的作品", kicker: "CREATOR OPERATING SYSTEM", components: [
+      { type: "creator-hero", eyebrow: "AUTONOMOUS CREATIVE SYSTEM · 0.3", title: "捕捉正在发生的，\n制作尚未出现的。", description: "BiliBot 负责观察世界，Creator 负责把热点与记忆变成可执行的视频项目。", primary_action: { id: "create-idea", label: "记录一个想法" }, secondary_target: "studio", secondary_label: "打开创作工坊", signal: { label: "HOST SIGNAL", value: "CONNECTED", detail: "BiliBot 1.5.0 · 安全只读连接" }, metrics: [{ label: "SIGNALS", value: d.signals.length }, { label: "ACTIVE", value: d.projects.length }, { label: "GATES", value: d.approvals.length }] },
+      { type: "creator-production-timeline", title: "15 阶段生产线", items: d.projects },
+      { type: "creator-approval-center", title: "今天需要你决定", items: d.approvals },
+      { type: "creator-proposal-list", title: "AI 主动提案", items: d.proposals },
+    ] },
+    ideas: { title: "先留下证据，再决定做什么", kicker: "SIGNAL / IDEA RADAR", components: [intro("01", "信号与灵感", "汇集主动观看、热门、番剧、关注更新与人工记录。", { id: "sync-host-context", label: "同步 Host" }), { type: "creator-signal-board", items: d.signals, action: { id: "sync-host-context", label: "同步信号" } }, { type: "creator-idea-board", items: d.ideas, empty: "暂无灵感" }] },
+    projects: { title: "让每一段素材都有来处，每一个决定都可追踪", kicker: "PROJECT / ASSET GRAPH", components: [intro("02", "项目宇宙", "脚本、分镜、素材、版本、投稿和复盘围绕同一项目持续演进。", { id: "create-project", label: "新建项目" }), { type: "creator-production-timeline", items: d.projects }, { type: "creator-project-grid", items: d.projects, empty: "还没有项目", expanded: true }, { type: "creator-asset-library", items: d.assets }] },
+    studio: { title: "把工具串成可观察、可暂停、可替换的工作流", kicker: "CREATIVE WORKBENCH", components: [intro("03", "创作工坊", "外部生成服务通过统一 Connector 加入；Creator 始终保存项目状态。"), { type: "creator-studio", projects: d.projects, runs: d.runs, connectors: d.connectors, stages: [{ label: "研究", capability: "research.organize", state: "ready" }, { label: "脚本", capability: "script.plan", state: "ready" }, { label: "分镜", capability: "storyboard.plan", state: "ready" }, { label: "生成", capability: "video.generate", state: "external" }, { label: "剪辑", capability: "media.transcode", state: "ready" }, { label: "合规", capability: "submission.validate", state: "guarded" }] }] },
+    workspace: { title: "素材会增长，空间必须可解释、可回收", kicker: "WORKSPACE / LIFECYCLE", components: [intro("04", "素材空间", "可视化工作区占用；破坏性清理必须预演、审批并一次性执行。"), { type: "creator-workspace", ...d.workspace }, { type: "creator-asset-library", items: d.assets }] },
+    opportunities: { title: "把机会变成候选，而不是未经确认的动作", kicker: "TAG / ACTIVITY / INCENTIVE", components: [intro("05", "投稿机会", "标签、活动和激励仅作为候选；报名等待可靠 Provider 和人工确认。"), { type: "creator-opportunity-board", items: d.opportunities }] },
+    insights: { title: "让每一次发布都留下可验证的认知", kicker: "ANALYTICS / RETROSPECTIVE", components: [intro("06", "数据回声", "在 1h、6h、24h、72h、7d 保存快照并形成复盘。"), { type: "creator-insights", submissions: d.submissions, snapshots: d.analytics, retrospectives: d.retrospectives, schedule: ["1H", "6H", "24H", "72H", "7D"], empty: "数据将成为下一次创作的材料。" }] },
+    governance: { title: "自动化应该可以被看见、被暂停，也可以被否决", kicker: "HUMAN CONTROL LAYER", components: [intro("07", "权限与确认", "每个阶段支持 manual / ask / auto / disabled；敏感步骤禁止全自动。"), { type: "creator-permission-matrix", policies: d.policies, host: { granted_permissions: ["account.identity.read", "memory.creator.read", "analytics.video.read", "opportunities.read"] } }, { type: "creator-approval-center", title: "审批中心", items: d.approvals }, { type: "creator-proposal-list", title: "AI 主动提案", items: d.proposals }] },
+    connections: { title: "连接能力，但不交出边界", kicker: "HOST / CONNECTOR MATRIX", components: [intro("08", "连接与能力", "外部工具只得到显式工作流输入，绝不会取得 B站 Cookie。", { id: "refresh-host", label: "刷新连接" }), { type: "creator-host-status", host: { bound: true, status: "online", host_version: "1.5.0", extension_api: 1, services: { "bilibili.account": [1], "memory.creator": [1], "creator.analytics": [1] }, granted_permissions: ["account.identity.read", "memory.creator.read", "memory.creator.write", "analytics.video.read", "opportunities.read"], account: { logged_in: true, uid: "10001", name: "Preview Creator" } } }, { type: "creator-connector-grid", items: d.connectors }] },
+  };
+  return { schema: "bilibot-schema-v1", page: pageId, ...(pages[pageId] || pages.dashboard) };
+}
+
 function regenerateMockSchedule() {
   const cfg = mock.config;
   const activity = clamp(num(cfg.AUTONOMOUS_ACTIVITY_LEVEL, 55), 0, 100);
@@ -335,15 +448,13 @@ function regenerateMockSchedule() {
   const now = new Date();
   const nowMinute = now.getHours() * 60 + now.getMinutes();
   const add = (time, label, kind, description, extra = {}) => events.push({ time, label, kind, description, triggered: minutesOf(time) < nowMinute, ...extra });
-  const proactiveMin = num(cfg.AUTONOMOUS_PROACTIVE_DAILY_MIN, 0);
-  const proactiveMax = Math.min(num(cfg.PROACTIVE_DAILY_LIMIT, 5), num(cfg.AUTONOMOUS_PROACTIVE_DAILY_MAX, 4));
+  const proactiveMax = Math.min(num(cfg.PROACTIVE_TIMES_COUNT, 2), num(cfg.AUTONOMOUS_PROACTIVE_DAILY_MAX, 4));
   const proactiveSoft = activity >= 85 ? 3 : activity >= 50 ? 2 : activity >= 20 ? 1 : 0;
-  const proactiveCount = cfg.ENABLE_PROACTIVE ? Math.min(proactiveMax, Math.max(proactiveMin, proactiveSoft)) : 0;
+  const proactiveCount = cfg.ENABLE_PROACTIVE ? Math.min(proactiveMax, proactiveSoft) : 0;
   [["10:20", "09:45", "11:15"], ["15:30", "14:45", "16:15"], ["20:15", "19:30", "21:00"]].slice(0, proactiveCount).forEach(([time, start_time, end_time]) => add(time, "主动浏览", "proactive", "浏览视频、选择感兴趣的内容", { start_time, end_time, trigger_policy: "once_in_window" }));
-  const dynamicMin = num(cfg.AUTONOMOUS_DYNAMIC_DAILY_MIN, 0);
   const dynamicMax = Math.min(num(cfg.DYNAMIC_DAILY_COUNT, 1), num(cfg.AUTONOMOUS_DYNAMIC_DAILY_MAX, 2));
   const dynamicSoft = activity >= 88 ? 2 : activity >= 40 ? 1 : 0;
-  const dynamicCount = cfg.ENABLE_DYNAMIC ? Math.min(dynamicMax, Math.max(dynamicMin, dynamicSoft)) : 0;
+  const dynamicCount = cfg.ENABLE_DYNAMIC ? Math.min(dynamicMax, dynamicSoft) : 0;
   ["16:30", "21:10"].slice(0, dynamicCount).forEach((time) => add(time, "发布动态", "dynamic", "根据今日状态发布一条动态"));
   if (cfg.ENABLE_BANGUMI && cfg.BANGUMI_PROACTIVE && activity >= 30) add("12:10", "追番", "bangumi", "检查更新或观看番剧");
   if (cfg.ENABLE_DYNAMIC_WATCH && activity >= 20) {
@@ -363,8 +474,8 @@ function regenerateMockSchedule() {
     autonomous_plan: {
       rationale: cfg.ENABLE_AUTONOMOUS_DAILY_PLAN ? `${activityLabel(activity)}状态下，根据真实开关与管理员边界生成今日节奏。` : "当前使用管理员固定计划。",
       generated_at: new Date().toLocaleString("zh-CN", { hour12: false }),
-      reply_target: cfg.ENABLE_REPLY ? Math.max(num(cfg.AUTONOMOUS_REPLY_DAILY_MIN, 0), Math.min(num(cfg.AUTONOMOUS_REPLY_DAILY_MAX, 80), Math.round(num(cfg.AUTONOMOUS_REPLY_DAILY_MIN, 0) + (num(cfg.AUTONOMOUS_REPLY_DAILY_MAX, 80) - num(cfg.AUTONOMOUS_REPLY_DAILY_MIN, 0)) * (0.15 + activity / 140)))) : 0,
-      private_target: cfg.ENABLE_PRIVATE_MESSAGES ? Math.max(num(cfg.AUTONOMOUS_PRIVATE_DAILY_MIN, 0), Math.min(num(cfg.AUTONOMOUS_PRIVATE_DAILY_MAX, 30), Math.round(num(cfg.AUTONOMOUS_PRIVATE_DAILY_MIN, 0) + (num(cfg.AUTONOMOUS_PRIVATE_DAILY_MAX, 30) - num(cfg.AUTONOMOUS_PRIVATE_DAILY_MIN, 0)) * (0.12 + activity / 150)))) : 0,
+      reply_cap: cfg.ENABLE_REPLY ? num(cfg.AUTONOMOUS_REPLY_DAILY_MAX, 80) : 0,
+      private_cap: cfg.ENABLE_PRIVATE_MESSAGES ? num(cfg.AUTONOMOUS_PRIVATE_DAILY_MAX, 30) : 0,
     },
     events,
   };
@@ -393,9 +504,11 @@ function unwrap(result) {
 async function apiGet(path, query = {}) {
   if (isPreview) {
     await sleep(70);
-    const map = { "stats": mock.stats, "persona/state": mock.persona, "config/schema": mock.schema, "config": mock.config, "account/info": mock.account, "schedule/today": mock.schedule, "schedule/stats": mock.scheduleStats, "memory/stats": mock.memory, "profiles": mock.profiles, "security/stats": mock.security, "tools/available": mock.availableTools, "cache/stats": mock.cache };
+    const map = { "stats": mock.stats, "persona/state": mock.persona, "config/schema": mock.schema, "config": mock.config, "account/info": mock.account, "schedule/today": mock.schedule, "schedule/stats": mock.scheduleStats, "memory/stats": mock.memory, "profiles": mock.profiles, "interest/status": mock.interest, "security/stats": mock.security, "tools/available": mock.availableTools, "cache/stats": mock.cache };
     if (path === "account/qr/generate") return { image: "", key: "preview", expires_in: 180 };
     if (path === "account/qr/poll") return { status: "waiting", message: "预览模式不连接真实账号" };
+    if (path === "extensions") return [mockCreatorManifest()];
+    if (path === "extensions/page") return { request_id: "preview-page", ok: true, data: { page: mockCreatorPage(query.page_id || "dashboard") }, error: null };
     return structuredClone(map[path] || {});
   }
   return unwrap(await bridge.apiGet(path, query));
@@ -419,6 +532,29 @@ async function apiPost(path, body = {}) {
       Object.entries(mock.cache.buckets || {}).forEach(([key, item]) => { if (deep || key !== "qr") item.bytes = 0; });
       mock.cache.total_bytes = Object.values(mock.cache.buckets || {}).reduce((sum, item) => sum + num(item.bytes), 0);
       return { mode: deep ? "deep" : "normal", removed_bytes: removedBytes, total_bytes: mock.cache.total_bytes };
+    }
+    if (path === "extensions/refresh") return [mockCreatorManifest()];
+    if (path === "extensions/action") {
+      const action = body.action_id;
+      const payload = body.payload || {};
+      let data = { accepted: true };
+      if (action === "create-idea") {
+        const idea = { id: `idea_${Date.now()}`, title: payload.title || "新灵感", summary: payload.angle || payload.summary || "等待补充创作角度", source: "manual", format: payload.format || "short", tags: String(payload.tags || "").split(",").map((item) => item.trim()).filter(Boolean), trend_score: 0, channel_fit_score: 0, copyright_status: "unknown", status: "inbox" };
+        mockCreatorData.ideas.unshift(idea); data = { idea };
+      } else if (action === "create-project") {
+        const project = { id: `project_${Date.now()}`, title: payload.title || "新项目", description: payload.description || "", status: "planning", progress: 8, content_type: payload.content_type || "short", tags: String(payload.tags || "").split(",").map((item) => item.trim()).filter(Boolean), updated_at: "刚刚" };
+        mockCreatorData.projects.unshift(project); data = { project };
+      } else if (action === "promote-idea") {
+        const idea = mockCreatorData.ideas.find((item) => item.id === payload.idea_id);
+        const project = { id: `project_${Date.now()}`, title: idea?.title || "灵感项目", description: idea?.summary || "", status: "planning", progress: 8, content_type: idea?.format || "short", tags: idea?.tags || [], updated_at: "刚刚" };
+        mockCreatorData.projects.unshift(project); data = { project };
+      } else if (action === "run-workflow") {
+        const run = { id: `run_${Date.now()}`, project_id: payload.project_id, workflow: payload.workflow || "short-video-foundation", status: "queued", progress: 0, current_step: "等待执行" };
+        mockCreatorData.runs.unshift(run); data = { run };
+      } else if (action === "request-upload" || action === "request-publish") {
+        return { request_id: "preview-action", ok: false, data: {}, error: { code: "permission_denied", message: "Extension API v1 默认不授予上传与发布权限" } };
+      }
+      return { request_id: "preview-action", ok: true, data, error: null };
     }
     return { saved: Object.keys(body) };
   }
@@ -446,27 +582,71 @@ function toast(title, message = "", type = "success") {
   setTimeout(() => node.remove(), 4200);
 }
 
+function activeExtension() {
+  return state.extensions.find((item) => item.id === state.activeExtensionId) || null;
+}
+
+function availableModeExtensions() {
+  return (Array.isArray(state.extensions) ? state.extensions : [])
+    .filter((item) => item && item.enabled !== false && item.id && item.presentation?.entry !== "hidden")
+    .sort((a, b) => num(a.presentation?.entry_priority, 100) - num(b.presentation?.entry_priority, 100));
+}
+
+function renderModeEntry(extensions) {
+  if (!extensions.length) return "";
+  const first = extensions[0];
+  const label = extensions.length === 1 ? (first.presentation?.switch_label || `进入 ${first.name || first.short_name || "扩展工作区"}`) : `切换工作模式（${extensions.length}）`;
+  const attrs = extensions.length === 1 ? `data-enter-extension="${esc(first.id)}"` : "data-open-mode-picker";
+  const popout = extensions.length === 1 && first.presentation?.standalone !== false
+    ? `<button class="mode-entry-popout" data-popout-extension="${esc(first.id)}" type="button" aria-label="在新标签页打开 ${esc(first.short_name || first.name || "扩展")}" title="在新标签页单独打开，便于对照检查">${icon("arrow-right")}</button>`
+    : "";
+  return `<div class="mode-entry-cluster"><button class="mode-entry-button" ${attrs} type="button" aria-label="${esc(label)}" title="${esc(label)}"><span>${icon(first.navigation?.[0]?.icon || "star")}</span><i></i>${extensions.length > 1 ? `<b>${extensions.length}</b>` : ""}</button>${popout}</div>`;
+}
+
+function openModePicker() {
+  const extensions = availableModeExtensions();
+  if (!extensions.length) return;
+  if (extensions.length === 1) return enterExtension(extensions[0].id);
+  const returnFocus = document.activeElement;
+  const close = () => { modalRoot.innerHTML = ""; document.removeEventListener("keydown", onEscape); if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus({ preventScroll: true }); };
+  const onEscape = (event) => { if (event.key === "Escape") close(); };
+  modalRoot.innerHTML = `<div class="modal-backdrop mode-picker-backdrop" data-mode-picker-backdrop><section class="mode-picker" role="dialog" aria-modal="true" aria-labelledby="mode-picker-title"><header><div><span>WORKSPACE SWITCHER</span><h2 id="mode-picker-title">选择工作模式</h2><p>入口完全由已启用扩展的 Manifest 动态生成。</p></div><button class="mode-picker-close" data-mode-picker-close type="button" aria-label="关闭">×</button></header><div class="mode-picker-grid">${extensions.map((item, index) => `<button class="mode-picker-card" data-mode-extension="${esc(item.id)}" type="button"><span class="mode-picker-index">${String(index + 1).padStart(2, "0")}</span><i>${icon(item.navigation?.[0]?.icon || "star")}</i><div><strong>${esc(item.name || item.short_name || item.id)}</strong><small>${esc(item.description || "独立扩展工作区")}</small></div>${icon("arrow-right")}</button>`).join("")}</div></section></div>`;
+  document.addEventListener("keydown", onEscape);
+  modalRoot.querySelectorAll("[data-mode-picker-close]").forEach((node) => node.addEventListener("click", close));
+  modalRoot.querySelector("[data-mode-picker-backdrop]")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) close(); });
+  modalRoot.querySelectorAll("[data-mode-extension]").forEach((node) => node.addEventListener("click", () => { const id = node.dataset.modeExtension; close(); enterExtension(id); }));
+  modalRoot.querySelector("[data-mode-extension]")?.focus();
+}
+
 function renderSidebar() {
+  if (state.mode === "extension" && activeExtension()) {
+    const extension = activeExtension();
+    const nav = [...(extension.navigation || [])].sort((a, b) => num(a.order) - num(b.order));
+    sidebar.className = "sidebar creator-sidebar";
+    sidebar.setAttribute("aria-label", `${extension.name || extension.short_name || "扩展"} 导航`);
+    sidebar.innerHTML = `<div class="creator-brand-lockup">${state.standalone ? "" : `<button class="creator-return" data-leave-extension type="button" aria-label="${esc(extension.presentation?.return_label || "返回 BiliBot")}">${icon("arrow-left")}</button>`}<div class="creator-brand-type"><span>BILIBOT /</span><strong>${esc(extension.short_name || extension.name || extension.id)}</strong><small>${esc(extension.presentation?.workspace_label || "EXTENSION WORKSPACE")}</small></div></div><div class="creator-live-signal"><i></i><span><b>HOST LINK</b>安全连接已建立</span><em>API 01</em></div><div class="creator-nav-label">WORKSPACE</div><nav class="creator-nav-list">${nav.map((item, index) => `<button class="creator-nav-item ${state.extensionPage === item.page ? "is-active" : ""}" data-extension-page="${esc(item.page)}" type="button" title="${esc(item.description || item.title)}" aria-current="${state.extensionPage === item.page ? "page" : "false"}"><span class="creator-nav-index">${String(index + 1).padStart(2, "0")}</span>${icon(item.icon || "star", "creator-nav-icon")}<span><b>${esc(item.title)}</b><small>${esc(item.description || "")}</small></span></button>`).join("")}</nav><div class="creator-sidebar-foot"><span>ISOLATED EXTENSION</span><p>不共享 Cookie · 不注入代码</p></div>`;
+    sidebar.querySelector("[data-leave-extension]")?.addEventListener("click", leaveExtension);
+    sidebar.querySelectorAll("[data-extension-page]").forEach((button) => button.addEventListener("click", () => navigateExtension(button.dataset.extensionPage)));
+    return;
+  }
+  sidebar.className = "sidebar";
+  sidebar.setAttribute("aria-label", "BiliBot 主导航");
   const running = state.stats.running !== false;
   const accountReady = state.stats.account_connected || state.account?.logged_in;
-  sidebar.innerHTML = `
-    <div class="sidebar-brand">
-      <div class="brand-mark"><img src="${esc(brandLogoUrl)}" alt="BiliBot" /></div>
-      <div class="brand-copy"><strong>BiliBot</strong><span>控制中心</span></div>
-    </div>
-    <div class="sidebar-state" aria-label="服务状态">
-      <span class="status-dot ${running ? "is-online" : ""}"></span>
-      <div><strong>${running ? "服务运行中" : "服务未运行"}</strong><span>${accountReady ? "账号链路已配置" : "等待连接账号"}</span></div>
-    </div>
-    <div class="nav-label">管理</div>
-    <nav class="nav-list">${NAV_ITEMS.map(([id, iconName, label, hint]) => `
-      <button class="nav-item ${state.currentPage === id ? "is-active" : ""}" data-page="${id}" type="button" title="${esc(hint)}" aria-current="${state.currentPage === id ? "page" : "false"}">
-        ${icon(iconName, "nav-icon")}<span>${esc(label)}</span>${id === "basics" && state.dirtyKeys.size ? `<b class="nav-badge">${state.dirtyKeys.size}</b>` : ""}
-      </button>`).join("")}</nav>`;
+  const modeExtensions = availableModeExtensions();
+  sidebar.innerHTML = `<div class="sidebar-brand"><div class="brand-mark"><img src="${esc(brandLogoUrl)}" alt="BiliBot" /></div><div class="brand-copy"><strong>BiliBot</strong><span>控制中心</span></div>${renderModeEntry(modeExtensions)}</div><div class="sidebar-state" aria-label="服务状态"><span class="status-dot ${running ? "is-online" : ""}"></span><div><strong>${running ? "服务运行中" : "服务未运行"}</strong><span>${accountReady ? "账号链路已配置" : "等待连接账号"}</span></div></div><div class="nav-label">管理</div><nav class="nav-list">${NAV_ITEMS.map(([id, iconName, label, hint]) => `<button class="nav-item ${state.currentPage === id ? "is-active" : ""}" data-page="${id}" type="button" title="${esc(hint)}" aria-current="${state.currentPage === id ? "page" : "false"}">${icon(iconName, "nav-icon")}<span>${esc(label)}</span>${id === "basics" && state.dirtyKeys.size ? `<b class="nav-badge">${state.dirtyKeys.size}</b>` : ""}</button>`).join("")}</nav>`;
   sidebar.querySelectorAll("[data-page]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.page)));
+  sidebar.querySelector("[data-enter-extension]")?.addEventListener("click", (event) => enterExtension(event.currentTarget.dataset.enterExtension));
+  sidebar.querySelector("[data-open-mode-picker]")?.addEventListener("click", openModePicker);
+  sidebar.querySelector("[data-popout-extension]")?.addEventListener("click", (event) => openExtensionStandalone(event.currentTarget.dataset.popoutExtension));
 }
 
 function updateSaveDock() {
+  if (state.mode === "extension") {
+    saveDock.classList.remove("is-visible");
+    saveDock.innerHTML = "";
+    return;
+  }
   const pendingChanges = state.dirtyKeys.size + (state.scheduleDirty ? 1 : 0);
   if (!pendingChanges && !state.isSaving) {
     saveDock.classList.remove("is-visible");
@@ -499,12 +679,21 @@ function openMobileNav() {
 
 async function loadBase() {
   if (!isPreview && bridge?.ready) await bridge.ready();
-  const [schema, config, stats, persona] = await Promise.all([apiGet("config/schema"), apiGet("config"), apiGet("stats"), apiGet("persona/state")]);
+  const [schema, config, stats, persona, extensions] = await Promise.all([
+    apiGet("config/schema"), apiGet("config"), apiGet("stats"), apiGet("persona/state"),
+    apiGet("extensions").catch(() => []),
+  ]);
   state.schema = schema || {};
   state.config = config || {};
   state.draft = structuredClone(state.config);
   state.stats = stats || {};
   state.persona = persona || {};
+  state.extensions = Array.isArray(extensions) ? extensions.filter((item) => item && item.enabled !== false) : [];
+  if (standaloneExtensionId && state.extensions.some((item) => item.id === standaloneExtensionId)) {
+    state.standalone = true;
+    await enterExtension(standaloneExtensionId);
+    return;
+  }
   await refreshPageData("overview");
   renderSidebar();
 }
@@ -535,7 +724,16 @@ async function refreshPageData(page) {
   } else if (page === "account") {
     state.account = await apiGet("account/info") || {};
   } else if (page === "interaction") {
-    state.stats = await apiGet("stats") || {};
+    const [stats, interest] = await Promise.all([
+      apiGet("stats"),
+      apiGet("interest/status").catch((error) => ({
+        ...(state.interest || {}),
+        error: error.message || "兴趣状态暂时无法读取",
+        stale: true,
+      })),
+    ]);
+    state.stats = stats || {};
+    state.interest = interest || {};
   } else if (page === "basics") {
     state.cache = await apiGet("cache/stats") || {};
   }
@@ -570,9 +768,102 @@ async function navigate(page) {
   }
 }
 
+function setVisualMode(mode) {
+  const extensionMode = mode === "extension";
+  const extension = extensionMode ? activeExtension() : null;
+  state.mode = extensionMode ? "extension" : "host";
+  app.classList.toggle("creator-mode", extensionMode);
+  document.body.classList.toggle("creator-mode", extensionMode);
+  document.documentElement.dataset.theme = extensionMode ? "creator" : "light";
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", extensionMode ? (extension?.presentation?.surface || "#080b12") : "#f6f8fc");
+  const mobileBrand = document.querySelector(".mobile-brand span");
+  if (mobileBrand) mobileBrand.textContent = extensionMode ? `BiliBot / ${extension?.short_name || extension?.name || "Extension"}` : "BiliBot";
+}
+
+function openExtensionStandalone(extensionId) {
+  if (!extensionId) return;
+  const url = new URL(location.href);
+  url.searchParams.set("ext", extensionId);
+  const opened = window.open(url.toString(), `bilibot-ext-${extensionId}`);
+  if (!opened) toast("无法打开新标签页", "浏览器拦截了弹出窗口，请允许后重试", "error");
+}
+
+async function enterExtension(extensionId) {
+  const extension = state.extensions.find((item) => item.id === extensionId);
+  if (!extension) return;
+  state.hostPage = state.currentPage;
+  state.activeExtensionId = extensionId;
+  state.extensionPage = extension.navigation?.[0]?.page || "dashboard";
+  setVisualMode("extension");
+  updateSaveDock();
+  renderSidebar();
+  closeMobileNav();
+  await loadExtensionPage(extensionId, state.extensionPage, true);
+}
+
+function leaveExtension() {
+  // Standalone tabs never loaded the host pages, so dropping back would land on an
+  // empty shell.  Reached only if a keyboard shortcut or stale node fires it.
+  if (state.standalone) return;
+  state.activeExtensionId = null;
+  state.extensionSchema = null;
+  setVisualMode("host");
+  state.currentPage = state.hostPage || state.currentPage || "overview";
+  renderSidebar();
+  renderCurrentPage();
+  updateSaveDock();
+  closeMobileNav();
+}
+
+async function navigateExtension(pageId) {
+  const extension = activeExtension();
+  if (!extension || !extension.navigation?.some((item) => item.page === pageId)) return;
+  if (pageId === state.extensionPage && state.extensionSchema && !content.querySelector(".error-state")) return;
+  state.extensionPage = pageId;
+  renderSidebar();
+  closeMobileNav();
+  await loadExtensionPage(extension.id, pageId);
+}
+
+async function loadExtensionPage(extensionId, pageId, entering = false) {
+  const token = ++state.pageToken;
+  state.extensionLoading = true;
+  content.setAttribute("aria-busy", "true");
+  content.classList.add("page-exit");
+  if (entering) { const extension = activeExtension(); content.innerHTML = `<section class="creator-loading"><span>EXTENSION MODE</span><strong>正在建立 ${esc(extension?.short_name || extension?.name || "扩展")} 工作台</strong><i></i></section>`; }
+  try {
+    const [response] = await Promise.all([apiGet("extensions/page", { extension_id: extensionId, page_id: pageId }), sleep(entering ? 260 : 120)]);
+    if (token !== state.pageToken || state.mode !== "extension") return;
+    if (!response?.ok) throw new Error(response?.error?.message || "扩展页面返回失败");
+    state.extensionSchema = response.data?.page || null;
+    content.innerHTML = renderExtensionPage(state.extensionSchema);
+    content.classList.remove("page-exit");
+    content.classList.add("page-enter");
+    bindCreatorContent();
+    requestAnimationFrame(() => requestAnimationFrame(() => content.classList.remove("page-enter")));
+    window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+    requestAnimationFrame(() => content.focus({ preventScroll: true }));
+  } catch (error) {
+    if (token !== state.pageToken) return;
+    content.innerHTML = renderCreatorError(error.message || "扩展页面暂时不可用");
+    content.classList.remove("page-exit");
+    bindCreatorContent();
+  } finally {
+    if (token === state.pageToken) {
+      state.extensionLoading = false;
+      content.removeAttribute("aria-busy");
+    }
+  }
+}
+
 function renderCurrentPage() {
-  content.innerHTML = renderPage(state.currentPage);
-  bindContent();
+  if (state.mode === "extension") {
+    content.innerHTML = state.extensionSchema ? renderExtensionPage(state.extensionSchema) : renderCreatorError("扩展页面尚未加载");
+    bindCreatorContent();
+  } else {
+    content.innerHTML = renderPage(state.currentPage);
+    bindContent();
+  }
   requestAnimationFrame(() => content.focus({ preventScroll: true }));
 }
 
@@ -594,7 +885,7 @@ function metricCard(label, value, foot, iconName, tone = "blue", progress = null
 }
 
 function sectionHead(title, subtitle = "", iconName = "settings", extra = "") {
-  return `<div class="section-head"><div class="section-title"><span class="section-icon">${icon(iconName)}</span><div><h2>${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</div></div>${extra}</div>`;
+  return `<div class="section-head"><div class="section-title">${iconName ? `<span class="section-icon">${icon(iconName)}</span>` : ""}<div><h2>${esc(title)}</h2>${subtitle ? `<p>${esc(subtitle)}</p>` : ""}</div></div>${extra}</div>`;
 }
 
 function valueLabel(key) {
@@ -692,6 +983,331 @@ function renderErrorState(title, message) {
   return `<section class="card error-state">${icon("shield")}<h2>${esc(title)}</h2><p>${esc(message)}</p>${button("重新读取", "refresh", "refresh", "primary")}</section>`;
 }
 
+const CREATOR_STATUS = {
+  planning: ["规划中", "planning"], producing: ["制作中", "working"], reviewing: ["审核中", "review"],
+  ready: ["待投稿", "ready"], awaiting_approval: ["待批准", "guarded"], published: ["已发布", "done"],
+  running: ["运行中", "working"], queued: ["排队中", "planning"], succeeded: ["已完成", "done"],
+  failed: ["失败", "danger"], inbox: ["候选", "planning"], converted_to_project: ["已推进", "done"],
+  new: ["新信号", "planning"], pending: ["待确认", "guarded"], approved: ["已批准", "done"],
+  rejected: ["已拒绝", "danger"], proposed: ["待采纳", "planning"], accepted: ["已采纳", "done"],
+};
+
+const CREATOR_CONNECTOR_STATUS = {
+  ready: ["可用", "done"], disabled: ["关闭", "neutral"], external: ["外部", "working"],
+  guarded: ["受保护", "guarded"], waiting: ["等待", "neutral"],
+};
+
+function creatorStatus(value, context = "content") {
+  const source = context === "connector" ? CREATOR_CONNECTOR_STATUS : CREATOR_STATUS;
+  const [label, tone] = source[value] || [String(value || "未知"), "neutral"];
+  return `<span class="creator-status tone-${esc(tone)}"><i></i>${esc(label)}</span>`;
+}
+
+function creatorTags(tags = []) {
+  return `<div class="creator-tags">${(Array.isArray(tags) ? tags : []).slice(0, 5).map((tag) => `<span>${esc(tag)}</span>`).join("")}</div>`;
+}
+
+function creatorAction(action, label, iconName = "arrow-right", style = "") {
+  if (!action?.id) return "";
+  return `<button class="creator-action ${style}" data-extension-action="${esc(action.id)}" type="button">${esc(label || action.label || action.id)}${icon(iconName)}</button>`;
+}
+
+function renderCreatorHero(component) {
+  const metrics = component.metrics || component.stats || [];
+  return `<section class="creator-hero">
+    <div class="creator-hero-copy">
+      <span class="creator-overline">${esc(component.eyebrow || "CREATOR MODE")}</span>
+      <h1>${esc(component.title || "Creator").replace(/\n/g, "<br>")}</h1>
+      <p>${esc(component.description || "")}</p>
+      <div class="creator-hero-actions">${creatorAction(component.primary_action, component.primary_action?.label, "arrow-right", "is-primary")}${component.secondary_target ? `<button class="creator-action is-ghost" data-extension-target="${esc(component.secondary_target)}" type="button">${esc(component.secondary_label || "继续")}${icon("arrow-right")}</button>` : ""}</div>
+      <div class="creator-metric-strip">${metrics.map((item) => `<div><span>${esc(item.label)}</span><strong>${esc(item.value)}</strong></div>`).join("")}</div>
+    </div>
+    <div class="creator-visual" aria-hidden="true">
+      <div class="creator-orbit orbit-a"><i></i><span>OBSERVE</span></div>
+      <div class="creator-orbit orbit-b"><i></i><span>CREATE</span></div>
+      <div class="creator-orbit orbit-c"><i></i><span>EVOLVE</span></div>
+      <div class="creator-core"><span>AI</span><strong>∞</strong><small>CREATIVE LOOP</small></div>
+      <div class="creator-signal-card"><span>${esc(component.signal?.label || "HOST SIGNAL")}</span><strong>${esc(component.signal?.value || "WAITING")}</strong><small>${esc(component.signal?.detail || "等待 Host")}</small></div>
+    </div>
+  </section>`;
+}
+
+function renderCreatorPipeline(component) {
+  const steps = component.items || component.steps || [];
+  return `<section class="creator-pipeline" aria-label="创作闭环">${steps.map((item, index) => `<article class="is-${esc(item.state || "waiting")}"><span>${String(item.index || index + 1).padStart(2, "0")}</span><div><strong>${esc(item.label)}</strong><small>${esc(item.detail || item.id || "")}</small></div>${index < steps.length - 1 ? `<i>${icon("arrow-right")}</i>` : ""}</article>`).join("")}</section>`;
+}
+
+function renderCreatorIdeas(component, board = false) {
+  const items = component.items || [];
+  return `<section class="creator-section ${board ? "creator-idea-board" : "creator-idea-list"}">
+    ${component.title ? `<header class="creator-section-head"><div><span>LIVE SIGNALS</span><h2>${esc(component.title)}</h2><p>${esc(component.subtitle || "")}</p></div>${creatorAction(component.action, component.action?.label, "arrow-right")}</header>` : ""}
+    <div class="creator-idea-grid">${items.length ? items.map((item, index) => `<article class="creator-idea-card" style="--delay:${index * 55}ms">
+      <div class="creator-card-top"><span class="creator-card-index">${String(index + 1).padStart(2, "0")}</span>${creatorStatus(item.status)}</div>
+      <span class="creator-source">${esc(String(item.source || "manual").toUpperCase())} / ${esc(String(item.format || "short").toUpperCase())}</span>
+      <h3>${esc(item.title)}</h3><p>${esc(item.summary || "等待补充创作角度")}</p>
+      <div class="creator-score-row"><span>趋势 <b>${num(item.trend_score)}</b></span><span>频道匹配 <b>${num(item.channel_fit_score)}</b></span><span>版权 <b>${esc(item.copyright_status || "unknown")}</b></span></div>
+      ${creatorTags(item.tags)}
+      <button class="creator-inline-action" data-extension-action="promote-idea" data-idea-id="${esc(item.id)}" type="button">推进为项目${icon("arrow-right")}</button>
+    </article>`).join("") : `<div class="creator-empty">${icon("lightning")}<strong>${esc(component.empty || "暂无灵感")}</strong><button data-extension-action="create-idea" type="button">记录第一条灵感</button></div>`}</div>
+  </section>`;
+}
+
+function renderCreatorProjects(component) {
+  const items = component.items || [];
+  return `<section class="creator-section creator-projects">
+    ${component.title ? `<header class="creator-section-head"><div><span>PROJECT PULSE</span><h2>${esc(component.title)}</h2><p>${esc(component.subtitle || "")}</p></div>${component.target ? `<button class="creator-action" data-extension-target="${esc(component.target)}" type="button">查看全部${icon("arrow-right")}</button>` : ""}</header>` : ""}
+    <div class="creator-project-grid">${items.length ? items.map((item, index) => `<article class="creator-project-card ${component.expanded ? "is-expanded" : ""}" style="--delay:${index * 60}ms">
+      <div class="creator-project-head"><span>${esc(String(item.content_type || "short").toUpperCase())}</span>${creatorStatus(item.status)}</div>
+      <h3>${esc(item.title)}</h3><p>${esc(item.description || "等待补充创作说明")}</p>${creatorTags(item.tags)}
+      <div class="creator-progress"><div><span>CREATIVE PROGRESS</span><b>${clamp(num(item.progress), 0, 100)}%</b></div><i><em style="width:${clamp(num(item.progress), 0, 100)}%"></em></i></div>
+      <footer><small>${esc(item.updated_at || "")}</small><button data-extension-action="run-workflow" data-project-id="${esc(item.id)}" type="button" aria-label="为 ${esc(item.title)} 运行工作流">${icon("play")}</button></footer>
+    </article>`).join("") : `<div class="creator-empty">${icon("video")}<strong>${esc(component.empty || "暂无项目")}</strong><button data-extension-action="create-project" type="button">创建项目</button></div>`}</div>
+  </section>`;
+}
+
+function renderCreatorIntro(component) {
+  return `<header class="creator-page-intro"><span class="creator-page-number">${esc(component.number || "00")}</span><div><span>CREATOR WORKSPACE</span><h1>${esc(component.title)}</h1><p>${esc(component.description || "")}</p></div>${creatorAction(component.action, component.action?.label, "arrow-right", "is-primary")}</header>`;
+}
+
+function renderCreatorStudio(component) {
+  const projects = component.projects || [];
+  const runs = component.runs || [];
+  const projectRows = projects.map((item) => `<div class="creator-studio-project-group"><button class="creator-studio-project" data-extension-action="run-workflow" data-project-id="${esc(item.id)}" type="button"><span>${icon("video")}</span><div><strong>${esc(item.title)}</strong><small>${esc(item.content_type)} · ${num(item.progress)}%</small></div>${icon("play")}</button><div class="creator-mini-actions"><button data-extension-action="plan-video" data-project-id="${esc(item.id)}" type="button">脚本/分镜</button><button data-extension-action="collect-asset" data-project-id="${esc(item.id)}" type="button">登记素材</button><button data-extension-action="prepare-submission" data-project-id="${esc(item.id)}" type="button">投稿草稿</button></div></div>`).join("");
+  const runRows = runs.map((run) => `<article class="creator-run"><div><span>${esc(run.workflow || "workflow")}</span>${creatorStatus(run.status)}</div><strong>${esc(run.current_step || "等待执行")}</strong><i><em style="width:${clamp(num(run.progress), 0, 100)}%"></em></i></article>`).join("");
+  return `<section class="creator-studio"><div class="creator-studio-map"><span class="creator-map-label">PIPELINE / CAPABILITY MAP</span><div>${(component.stages || []).map((stage, index) => `<article class="is-${esc(stage.state || "waiting")}"><span>${String(index + 1).padStart(2, "0")}</span><strong>${esc(stage.label)}</strong><small>${esc(stage.capability)}</small></article>`).join("")}</div></div><div class="creator-studio-columns"><section><header><span>PROJECT INPUT</span><h2>选择创作载体</h2></header>${projectRows || `<p class="creator-empty-line">先创建一个项目</p>`}</section><section><header><span>WORKFLOW RUNS</span><h2>正在发生</h2></header>${runRows || `<p class="creator-empty-line">暂无运行任务</p>`}</section></div></section>`;
+}
+
+function renderCreatorInsights(component) {
+  const schedule = component.schedule || [];
+  const snapshots = component.snapshots || [];
+  const retrospectives = component.retrospectives || [];
+  const submissions = component.submissions || [];
+  const latest = snapshots[0] || {};
+  const submissionRows = submissions.slice(0, 6).map((item) => `<article class="creator-submission-row"><div><span>${esc(item.state || "draft")}</span><strong>${esc(item.title || "未命名投稿")}</strong><small>${esc((item.tags || []).join(" · "))}</small></div><div><button data-extension-action="request-upload" data-submission-id="${esc(item.id)}" data-project-id="${esc(item.project_id)}" type="button">申请上传</button><button data-extension-action="request-publish" data-submission-id="${esc(item.id)}" data-project-id="${esc(item.project_id)}" type="button">申请发布</button></div></article>`).join("");
+  return `<section class="creator-insights"><div class="creator-echo-visual" aria-hidden="true"><div class="echo-rings"></div><span>${num(latest.views).toLocaleString()} VIEWS</span><strong>→</strong><em>STYLE</em></div><div class="creator-insights-copy"><span>POST-PUBLISH LEARNING LOOP</span><h2>数据不是终点，<br>是下一次创作的材料。</h2><p>${esc(component.empty || "等待数据")}</p><div class="creator-snapshot-schedule">${schedule.map((item, index) => `<span class="${index === 0 ? "is-active" : ""}">${esc(item)}</span>`).join("")}</div><div class="creator-insight-actions"><button data-extension-action="capture-analytics" type="button">记录数据快照</button><button data-extension-action="create-retrospective" type="button">创建复盘</button></div><div class="creator-insight-ledger"><article><span>投稿草稿</span><b>${submissions.length}</b></article><article><span>数据快照</span><b>${snapshots.length}</b></article><article><span>复盘记录</span><b>${retrospectives.length}</b></article></div>${submissionRows ? `<div class="creator-submission-list">${submissionRows}</div>` : ""}<div class="creator-rule-placeholder"><b>STYLE RULES</b><span>${esc(retrospectives[0]?.summary || "当样本足够时，这里只保存可验证、可撤销的风格假设。")}</span></div></div></section>`;
+}
+
+function renderCreatorHost(component) {
+  const host = component.host || {};
+  const permissions = host.granted_permissions || [];
+  return `<section class="creator-host-matrix"><div class="creator-host-primary"><span class="creator-host-pulse ${host.bound ? "is-online" : ""}"><i></i></span><div><span>BILIBOT HOST</span><h2>${host.bound ? "已安全连接" : "等待连接"}</h2><p>Host ${esc(host.host_version || "—")} · Extension API ${esc(host.extension_api || "—")}</p></div><strong>${host.bound ? "ONLINE" : "OFFLINE"}</strong></div><div class="creator-host-facts"><article><span>ACCOUNT</span><b>${host.account?.logged_in ? "CONNECTED" : "NOT CONNECTED"}</b><small>仅共享 UID 与登录状态，不共享 Cookie</small></article><article><span>SERVICES</span><b>${Object.keys(host.services || {}).length}</b><small>${esc(Object.keys(host.services || {}).join(" · ") || "暂无能力")}</small></article><article><span>GRANTS</span><b>${permissions.length}</b><small>${esc(permissions.join(" · ") || "无")}</small></article></div></section>`;
+}
+
+function renderCreatorConnectors(component) {
+  return `<section class="creator-section"><header class="creator-section-head"><div><span>TOOL ORCHESTRATION</span><h2>连接器矩阵</h2><p>外部工具只接收明确的任务输入，发布能力始终留在 Host 边界内。</p></div></header><div class="creator-connector-grid">${(component.items || []).map((item) => `<article class="creator-connector-card ${item.enabled ? "is-ready" : "is-disabled"}"><div><span>${item.kind === "builtin" ? "LOCAL" : "REMOTE"}</span>${creatorStatus(item.state, "connector")}</div><h3>${esc(item.name)}</h3><p>${item.configured ? "能力已配置，可由工作流显式调用。" : "等待管理员在 Creator 插件外部配置中接入。"}</p>${creatorTags(item.capabilities)}<footer><b>${item.enabled ? "AVAILABLE" : "DISABLED"}</b><span>${esc(item.id)}</span></footer></article>`).join("")}</div></section>`;
+}
+
+const CREATOR_STAGE_LABELS = {
+  signal: "信号", idea: "灵感", research: "研究", script: "脚本", storyboard: "分镜", asset: "素材",
+  generation: "生成", editing: "剪辑", packaging: "包装", compliance: "合规", submission: "投稿草稿",
+  upload: "上传", publish: "发布", analytics: "数据", retrospective: "复盘", proposal: "提案",
+  "opportunity-enroll": "活动报名", "workspace-cleanup": "空间清理",
+};
+const CREATOR_POLICY_LABELS = { manual: "仅人工", ask: "执行前询问", auto: "自动执行", disabled: "禁用" };
+const CREATOR_PIPELINE = ["signal", "idea", "research", "script", "storyboard", "asset", "generation", "editing", "packaging", "compliance", "submission", "upload", "publish", "analytics", "retrospective"];
+const CREATOR_SENSITIVE_STAGES = ["compliance", "upload", "publish", "opportunity-enroll", "workspace-cleanup"];
+
+function renderCreatorTimeline(component) {
+  const items = component.items || [];
+  const projects = items.map((project) => {
+    const current = Math.max(0, CREATOR_PIPELINE.indexOf(project.stage));
+    const stages = CREATOR_PIPELINE.map((stage, index) => `<div role="listitem" class="${index < current ? "is-done" : index === current ? "is-current" : ""}" title="${esc(CREATOR_STAGE_LABELS[stage])}"><i></i><span>${esc(CREATOR_STAGE_LABELS[stage])}</span></div>`).join("");
+    return `<article class="creator-timeline-project"><header><div><span>${esc(project.content_type || "video")}</span><h3>${esc(project.title)}</h3></div>${creatorStatus(project.status)}</header><div class="creator-stage-rail" role="list" aria-label="${esc(project.title)} 制作进度">${stages}</div></article>`;
+  }).join("");
+  return `<section class="creator-section creator-timeline"><header class="creator-section-head"><div><span>PRODUCTION GRAPH</span><h2>${esc(component.title || "生产时间线")}</h2><p>所有项目沿同一条十五阶段生产线推进，任何节点都可暂停并交还人工。</p></div></header>${projects || `<div class="creator-empty-line">${esc(component.empty || "暂无生产项目")}</div>`}</section>`;
+}
+
+function renderCreatorSignals(component) {
+  const items = component.items || [];
+  const cards = items.map((item) => `<article><header><span>${esc(String(item.source || "host").toUpperCase())}</span>${creatorStatus(item.state || "new")}</header><h3>${esc(item.title)}</h3><p>${esc(item.summary || "等待进一步研究")}</p><div class="creator-signal-score"><span>热度 <b>${num(item.heat_score)}</b></span><span>相关 <b>${num(item.relevance_score)}</b></span></div>${creatorTags(item.tags)}</article>`).join("");
+  return `<section class="creator-section creator-signal-board"><header class="creator-section-head"><div><span>OBSERVATION FEED</span><h2>热点与观看信号</h2><p>只同步公开标题、摘要、标签与相关度，不传递账号凭据。</p></div>${creatorAction(component.action, component.action?.label, "refresh")}</header><div class="creator-signal-grid">${cards || `<div class="creator-empty">${icon("lightning")}<strong>${esc(component.empty || "暂无内容信号")}</strong><button data-extension-action="sync-host-context" type="button">同步 Host 上下文</button></div>`}</div></section>`;
+}
+
+function renderCreatorAssets(component) {
+  const items = component.items || [];
+  const cards = items.map((item) => `<article><div class="creator-asset-icon">${icon(item.kind === "image" || item.kind === "cover" ? "sun" : "video")}</div><div><span>${esc(String(item.kind || "file").toUpperCase())} · ${formatBytes(item.size_bytes)}</span><h3>${esc(item.name)}</h3><p>${esc(item.path || item.uri || "未绑定本地路径")}</p>${creatorTags([item.source, item.lifecycle, item.copyright_status].filter(Boolean))}</div></article>`).join("");
+  return `<section class="creator-section creator-assets"><header class="creator-section-head"><div><span>ASSET LIFECYCLE</span><h2>${esc(component.title || "素材库")}</h2><p>路径、版权、来源、大小与生命周期均可追踪。</p></div><button class="creator-action" data-extension-action="collect-asset" type="button">登记素材${icon("arrow-right")}</button></header><div class="creator-asset-grid">${cards || `<div class="creator-empty-line">${esc(component.empty || "暂无素材")}</div>`}</div></section>`;
+}
+
+function renderCreatorWorkspace(component) {
+  const buckets = Object.entries(component.buckets || {});
+  const candidates = component.cleanup_candidates || [];
+  const bucketCards = buckets.map(([key, item]) => `<article><span>${esc(key.toUpperCase())}</span><strong>${esc(item.label || formatBytes(item.bytes))}</strong><i><em style="width:${component.total_bytes ? clamp(num(item.bytes) / num(component.total_bytes) * 100, 0, 100) : 0}%"></em></i><small>${num(item.files)} 个文件</small></article>`).join("");
+  const candidateRows = candidates.slice(0, 20).map((item, index) => `<label><input type="checkbox" data-workspace-path value="${esc(item.path)}" ${index < 8 ? "checked" : ""}/><span><b>${esc(item.reason || "candidate")}</b><small>${esc(item.path)}</small></span><em>${formatBytes(item.size_bytes)}</em></label>`).join("");
+  return `<section class="creator-section creator-workspace"><header class="creator-section-head"><div><span>STORAGE TELEMETRY</span><h2>Creator 工作区</h2><p>${esc(component.root || "Creator 私有目录")}</p></div><div class="creator-workspace-total"><strong>${esc(component.total_label || formatBytes(component.total_bytes))}</strong><span>${num(component.files)} FILES</span></div></header><div class="creator-workspace-buckets">${bucketCards}</div><div class="creator-cleanup-panel"><header><div><span>SAFE CLEANUP PREVIEW</span><h3>可释放 ${esc(component.cleanup_label || formatBytes(component.cleanup_bytes))}</h3></div><button class="creator-action is-ghost" data-workspace-cleanup-preview type="button" ${candidates.length ? "" : "disabled"}>预演并申请清理${icon("shield")}</button></header><div class="creator-cleanup-list">${candidateRows || "<p>当前没有临时或孤儿素材。</p>"}</div></div></section>`;
+}
+
+function renderCreatorOpportunities(component) {
+  const items = component.items || [];
+  const cards = items.map((item) => `<article><header><span>${esc(String(item.kind || "tag").toUpperCase())}</span><b>${Math.round(num(item.confidence) * 100)}%</b></header><h3>${esc(item.title)}</h3><p>${esc(item.summary || item.description || item.reason || "等待验证")}</p>${creatorTags(item.tags || [item.source])}<footer><span>${esc(item.source || "host")}</span><button data-extension-action="request-opportunity-enroll" data-opportunity-id="${esc(item.id)}" type="button">申请参与</button></footer></article>`).join("");
+  return `<section class="creator-section creator-opportunities"><header class="creator-section-head"><div><span>OPPORTUNITY PROVIDERS</span><h2>标签、活动与激励候选</h2><p>候选不等于已报名；只有可靠来源和人工确认后才进入执行边界。</p></div><button class="creator-action" data-extension-action="scan-opportunities" type="button">刷新候选${icon("refresh")}</button></header><div class="creator-opportunity-grid">${cards || `<div class="creator-empty">${icon("star")}<strong>${esc(component.empty || "暂无可靠候选")}</strong><button data-extension-action="scan-opportunities" type="button">开始探测</button></div>`}</div></section>`;
+}
+
+function renderCreatorApprovals(component) {
+  const items = component.items || [];
+  const rows = items.map((item) => {
+    let followup = "";
+    if (item.state === "approved" && !item.consumed_at && item.stage === "workspace-cleanup") followup = `<footer><button class="is-primary" data-workspace-cleanup-approval="${esc(item.id)}" type="button">执行已批准清理</button></footer>`;
+    if (item.state === "approved" && !item.consumed_at && ["upload", "publish"].includes(item.stage)) followup = `<footer><button class="is-primary" data-sensitive-action="request-${esc(item.stage)}" data-approval-id="${esc(item.id)}" type="button">执行${esc(CREATOR_STAGE_LABELS[item.stage])}</button></footer>`;
+    if (item.state === "approved" && !item.consumed_at && item.stage === "opportunity-enroll") followup = `<footer><span>已批准，等待活动 Provider 接口执行</span></footer>`;
+    return `<article class="is-${esc(item.state || "pending")}"><div class="creator-risk"><span>${esc(String(item.risk || "medium").toUpperCase())}</span>${creatorStatus(item.consumed_at ? "executed" : item.state || "pending")}</div><h3>${esc(item.title || item.stage)}</h3><p>${esc(item.reason || `阶段：${CREATOR_STAGE_LABELS[item.stage] || item.stage || "未知"}`)}</p><small>${esc(item.requested_by || "system")} · ${esc(item.created_at || "")}</small>${item.state === "pending" ? `<footer><button data-extension-action="decide-approval" data-approval-id="${esc(item.id)}" data-decision="rejected" type="button">拒绝</button><button data-extension-action="decide-approval" data-approval-id="${esc(item.id)}" data-decision="approved" type="button">批准</button></footer>` : followup}</article>`;
+  }).join("");
+  return `<section class="creator-section creator-approvals"><header class="creator-section-head"><div><span>HUMAN GATES</span><h2>${esc(component.title || "审批中心")}</h2><p>上传、发布、活动报名与破坏性清理等敏感动作只能由人明确决定。</p></div></header><div class="creator-approval-list">${rows || `<div class="creator-empty-line">${esc(component.empty || "暂无审批")}</div>`}</div></section>`;
+}
+
+
+function renderCreatorPermissions(component) {
+  const policies = component.policies || {};
+  const host = component.host || {};
+  const rows = Object.entries(policies).map(([stage, mode]) => {
+    const sensitive = CREATOR_SENSITIVE_STAGES.includes(stage);
+    const options = Object.entries(CREATOR_POLICY_LABELS).map(([value, label]) => `<option value="${value}" ${value === mode ? "selected" : ""} ${value === "auto" && sensitive ? "disabled" : ""}>${esc(label)}</option>`).join("");
+    return `<label><span><b>${esc(CREATOR_STAGE_LABELS[stage] || stage)}</b><small>${sensitive ? "敏感阶段，禁止全自动" : "可随时暂停或交还人工"}</small></span><select data-policy-stage="${esc(stage)}" aria-label="${esc(CREATOR_STAGE_LABELS[stage] || stage)} 自动化策略">${options}</select></label>`;
+  }).join("");
+  return `<section class="creator-section creator-permissions"><header class="creator-section-head"><div><span>AUTOMATION CONTROL</span><h2>阶段权限矩阵</h2><p>Creator 策略与 Host 权限相互独立；Host 始终保留最终边界。</p></div><div class="creator-grant-count"><strong>${(host.granted_permissions || []).length}</strong><span>HOST GRANTS</span></div></header><div class="creator-policy-grid">${rows}</div><div class="creator-host-grants">${creatorTags(host.granted_permissions || [])}</div></section>`;
+}
+
+function renderCreatorProposals(component) {
+  const items = component.items || [];
+  const cards = items.map((item) => `<article><header><span>${esc(CREATOR_STAGE_LABELS[item.stage] || item.stage || "IDEA")}</span>${creatorStatus(item.state || "proposed")}</header><h3>${esc(item.title)}</h3><p>${esc(item.description || "")}</p><div class="creator-confidence"><i><em style="width:${clamp(num(item.confidence) * 100, 0, 100)}%"></em></i><span>${Math.round(num(item.confidence) * 100)}% CONFIDENCE</span></div>${item.state === "proposed" ? `<footer><button data-extension-action="decide-proposal" data-proposal-id="${esc(item.id)}" data-decision="rejected" type="button">忽略</button><button data-extension-action="decide-proposal" data-proposal-id="${esc(item.id)}" data-decision="accepted" type="button">采纳</button></footer>` : ""}</article>`).join("");
+  return `<section class="creator-section creator-proposals"><header class="creator-section-head"><div><span>AI INITIATIVE</span><h2>${esc(component.title || "AI 主动提案")}</h2><p>AI 可以主动发现机会，但只能提出建议，不能绕过审批。</p></div><button class="creator-action" data-extension-action="create-proposal" type="button">提出想法${icon("arrow-right")}</button></header><div class="creator-proposal-grid">${cards || `<div class="creator-empty-line">${esc(component.empty || "暂无提案")}</div>`}</div></section>`;
+}
+
+
+function renderExtensionComponent(component) {
+  const renderers = {
+    "creator-hero": renderCreatorHero,
+    "creator-pipeline": renderCreatorPipeline,
+    "creator-idea-list": (item) => renderCreatorIdeas(item, false),
+    "creator-idea-board": (item) => renderCreatorIdeas(item, true),
+    "creator-project-grid": renderCreatorProjects,
+    "creator-page-intro": renderCreatorIntro,
+    "creator-studio": renderCreatorStudio,
+    "creator-insights": renderCreatorInsights,
+    "creator-host-status": renderCreatorHost,
+    "creator-connector-grid": renderCreatorConnectors,
+    "creator-production-timeline": renderCreatorTimeline,
+    "creator-signal-board": renderCreatorSignals,
+    "creator-asset-library": renderCreatorAssets,
+    "creator-workspace": renderCreatorWorkspace,
+    "creator-opportunity-board": renderCreatorOpportunities,
+    "creator-approval-center": renderCreatorApprovals,
+    "creator-permission-matrix": renderCreatorPermissions,
+    "creator-proposal-list": renderCreatorProposals,
+  };
+  const renderer = renderers[component?.type];
+  return renderer ? renderer(component) : `<section class="creator-unknown">${icon("shield")}<strong>不支持的安全组件</strong><span>${esc(component?.type || "unknown")}</span></section>`;
+}
+
+function renderExtensionPage(schema) {
+  const extension = activeExtension();
+  if (!schema || schema.schema !== "bilibot-schema-v1" || !Array.isArray(schema.components)) return renderCreatorError("扩展返回了不兼容的 Page Schema");
+  return `<div class="creator-stage"><div class="creator-grid-noise" aria-hidden="true"></div><header class="creator-stage-head"><span>${esc(schema.kicker || `BILIBOT / ${extension?.short_name || "EXTENSION"}`)}</span><div><i></i><b>LIVE WORKSPACE</b></div></header>${schema.components.map(renderExtensionComponent).join("")}<footer class="creator-stage-footer"><span>BILIBOT EXTENSION API 01</span><p>${esc(extension?.short_name || extension?.name || "扩展")} 仅通过安全数据 Schema 与 Host 能力接口运行</p></footer></div>`;
+}
+
+function renderCreatorError(message) {
+  const extension = activeExtension();
+  return `<div class="creator-stage"><section class="creator-error error-state">${icon("shield")}<span>EXTENSION ISOLATED</span><h2>${esc(extension?.short_name || extension?.name || "扩展")} 暂时没有响应</h2><p>${esc(message)}</p><div><button class="creator-action is-primary" data-extension-retry type="button">重新连接${icon("refresh")}</button><button class="creator-action is-ghost" data-leave-extension type="button">返回 BiliBot${icon("arrow-left")}</button></div></section></div>`;
+}
+
+function creatorProjectContext(source) {
+  const projectId = source?.dataset.projectId || "";
+  const components = Array.isArray(state.extensionSchema?.components) ? state.extensionSchema.components : [];
+  const projectComponent = components.find((item) => item?.type === "creator-project-grid") || components.find((item) => item?.type === "creator-studio") || components.find((item) => item?.type === "creator-production-timeline");
+  const connectorComponent = components.find((item) => item?.type === "creator-connector-grid") || components.find((item) => item?.type === "creator-studio");
+  const assetComponent = components.find((item) => item?.type === "creator-asset-library");
+  return {
+    projectId,
+    projects: projectComponent?.items || projectComponent?.projects || (isPreview ? mockCreatorData.projects : []),
+    connectors: connectorComponent?.items || connectorComponent?.connectors || (isPreview ? mockCreatorData.connectors : []),
+    assets: assetComponent?.items || [],
+  };
+}
+
+function creatorSelectOptions(items, selected, empty, labelKey = "title") {
+  return items.length ? items.map((item) => `<option value="${esc(item.id)}" ${item.id === selected ? "selected" : ""}>${esc(item[labelKey] || item.name || item.id)}</option>`).join("") : `<option value="" disabled selected>${esc(empty)}</option>`;
+}
+
+function openCreatorModal(actionId, source = null) {
+  const direct = {
+    "refresh-host": {}, "sync-host-context": {}, "scan-opportunities": {},
+    "promote-idea": { idea_id: source?.dataset.ideaId || "" },
+    "request-opportunity-enroll": { opportunity_id: source?.dataset.opportunityId || "" },
+    "request-upload": { submission_id: source?.dataset.submissionId || "", project_id: source?.dataset.projectId || "" },
+    "request-publish": { submission_id: source?.dataset.submissionId || "", project_id: source?.dataset.projectId || "" },
+    "decide-approval": { approval_id: source?.dataset.approvalId || "", decision: source?.dataset.decision || "" },
+    "decide-proposal": { proposal_id: source?.dataset.proposalId || "", decision: source?.dataset.decision || "" },
+  };
+  if (Object.prototype.hasOwnProperty.call(direct, actionId)) return runCreatorAction(actionId, direct[actionId]);
+  const { projectId, projects, connectors, assets } = creatorProjectContext(source);
+  const projectOptions = creatorSelectOptions(projects, projectId, "请先创建项目");
+  const connectorOptions = creatorSelectOptions(connectors.filter((item) => item.enabled !== false), "", "暂无可用执行器", "name");
+  const assetOptions = `<option value="">暂不选择</option>${assets.map((item) => `<option value="${esc(item.id)}">${esc(item.name || item.id)}</option>`).join("")}`;
+  const configs = {
+    "create-idea": { title: "记录一个想法", subtitle: "先留下足够清晰的创作方向，不急着生成。", fields: `<label>标题<input name="title" required maxlength="120" placeholder="把今天看到的热点做成 60 秒观点短片" /></label><label>创作角度<textarea name="angle" rows="3" placeholder="为什么值得做？准备从哪里切入？"></textarea></label><div class="creator-form-row"><label>形式<select name="format"><option value="short">短视频</option><option value="essay">观点视频</option><option value="clip">切片</option></select></label><label>标签<input name="tags" placeholder="AI, 热点, 二创" /></label></div>` },
+    "create-project": { title: "创建创作项目", subtitle: "脚本、素材、工作流、投稿与复盘都归属同一项目。", fields: `<label>项目名称<input name="title" required maxlength="120" /></label><label>创作说明<textarea name="description" rows="3"></textarea></label><div class="creator-form-row"><label>内容类型<select name="content_type"><option value="short">竖屏短片</option><option value="essay">观点视频</option><option value="clip">切片</option></select></label><label>标签<input name="tags" placeholder="系列, 风格" /></label></div>` },
+    "plan-video": { title: "规划脚本与分镜", subtitle: "把目标、节奏和镜头结构变成可检查的计划。", fields: `<label>项目<select name="project_id" required>${projectOptions}</select></label><label>核心表达<textarea name="logline" rows="3" required></textarea></label><div class="creator-form-row"><label>目标受众<input name="audience" /></label><label>时长（秒）<input name="duration_seconds" type="number" min="5" max="7200" value="60" /></label></div><div class="creator-form-row"><label>画幅<select name="aspect_ratio"><option value="9:16">9:16 竖屏</option><option value="16:9">16:9 横屏</option><option value="1:1">1:1 方形</option></select></label><label>风格<input name="style" placeholder="实验性、克制、信息密度高" /></label></div>` },
+    "collect-asset": { title: "登记素材", subtitle: "素材只记录在 Creator 工作区，不会自动发送到外部服务。", fields: `<label>项目<select name="project_id">${projectOptions}</select></label><div class="creator-form-row"><label>素材名称<input name="name" required /></label><label>类型<select name="kind"><option value="video">视频</option><option value="image">图片</option><option value="audio">音频</option><option value="subtitle">字幕</option><option value="reference">参考资料</option></select></label></div><label>本地路径<input name="path" placeholder="Creator 数据目录中的文件路径" /></label><div class="creator-form-row"><label>来源<input name="source" value="local" /></label><label>版权状态<select name="copyright_status"><option value="unknown">待确认</option><option value="owned">自有</option><option value="licensed">已授权</option><option value="public-domain">公有领域</option></select></label></div>` },
+    "run-workflow": { title: "启动创作工作流", subtitle: "外部执行器只接收显式任务输入，绝不会得到 B站凭据。", fields: `<label>项目<select name="project_id" required>${projectOptions}</select></label><label>工作流<select name="workflow"><option value="short-video-foundation">短视频基础工作流</option><option value="storyboard-first">分镜优先工作流</option><option value="clip-remix">切片与二创工作流</option></select></label><label>执行器<select name="connector_id">${connectorOptions}</select></label><label>输入变量（JSON）<textarea name="inputs_json" rows="4" placeholder='{"prompt":"..."}'></textarea></label>` },
+    "prepare-submission": { title: "准备投稿草稿", subtitle: "只生成草稿与合规审批，不会直接上传或发布。", fields: `<label>项目<select name="project_id" required>${projectOptions}</select></label><label>标题<input name="title" required maxlength="80" /></label><label>简介<textarea name="description" rows="4"></textarea></label><div class="creator-form-row"><label>标签<input name="tags" placeholder="最多 10 个，以逗号分隔" /></label><label>分区 ID<input name="category_id" type="number" min="0" /></label></div><div class="creator-form-row"><label>成片素材<select name="video_asset_id">${assetOptions}</select></label><label>封面素材<select name="cover_asset_id">${assetOptions}</select></label></div><label class="creator-check"><input name="ai_generated" type="checkbox" value="true" /><span>内容包含 AI 生成部分</span></label><label>版权状态<select name="copyright_status"><option value="unknown">待确认</option><option value="owned">自有</option><option value="licensed">已授权</option></select></label>` },
+    "create-proposal": { title: "创建主动提案", subtitle: "提案会进入人工确认，不会自动执行。", fields: `<label>提案标题<input name="title" required maxlength="120" /></label><label>提案说明<textarea name="description" rows="4" required></textarea></label><div class="creator-form-row"><label>阶段<select name="stage"><option value="idea">灵感</option><option value="research">研究</option><option value="generation">生成</option><option value="analytics">数据</option></select></label><label>预期价值<input name="expected_value" /></label></div><label>关联项目<select name="project_id"><option value="">无</option>${projectOptions}</select></label>` },
+    "capture-analytics": { title: "记录数据快照", subtitle: "可从 Host 公共视频数据读取，也可人工补录。", fields: `<label>项目<select name="project_id" required>${projectOptions}</select></label><div class="creator-form-row"><label>BV 号<input name="bvid" placeholder="BV..." /></label><label>窗口<select name="window"><option value="1h">1H</option><option value="6h">6H</option><option value="24h">24H</option><option value="72h">72H</option><option value="7d">7D</option></select></label></div><div class="creator-form-row"><label>播放<input name="views" type="number" min="0" value="0" /></label><label>点赞<input name="likes" type="number" min="0" value="0" /></label></div><div class="creator-form-row"><label>投币<input name="coins" type="number" min="0" value="0" /></label><label>收藏<input name="favorites" type="number" min="0" value="0" /></label></div><div class="creator-form-row"><label>分享<input name="shares" type="number" min="0" value="0" /></label><label>评论<input name="replies" type="number" min="0" value="0" /></label></div>` },
+    "create-retrospective": { title: "创建创作复盘", subtitle: "把结果转化为下一轮可验证的实验。", fields: `<label>项目<select name="project_id" required>${projectOptions}</select></label><label>总结<textarea name="summary" rows="4" required></textarea></label><label>做对了什么<input name="wins" placeholder="逗号分隔" /></label><label>需要改进<input name="misses" placeholder="逗号分隔" /></label><label>下一轮实验<input name="experiments" placeholder="逗号分隔" /></label><label>候选风格规则<input name="style_rules" placeholder="可撤销、可验证，逗号分隔" /></label>` },
+  };
+  const config = configs[actionId];
+  if (!config) return toast("动作尚未开放", actionId, "error");
+  modalRoot.innerHTML = `<div class="modal-backdrop creator-modal-backdrop" data-modal-backdrop><form class="creator-modal" role="dialog" aria-modal="true" aria-labelledby="creator-modal-title"><header><span>CREATOR ACTION</span><button type="button" data-creator-close aria-label="关闭">×</button></header><h2 id="creator-modal-title">${esc(config.title)}</h2><p>${esc(config.subtitle)}</p><div class="creator-form">${config.fields}</div><footer><button class="creator-action is-ghost" data-creator-close type="button">取消</button><button class="creator-action is-primary" type="submit">确认并继续${icon("arrow-right")}</button></footer></form></div>`;
+  const form = modalRoot.querySelector("form");
+  const returnFocus = document.activeElement;
+  const close = () => { modalRoot.innerHTML = ""; document.removeEventListener("keydown", handleEscape); if (returnFocus instanceof HTMLElement && returnFocus.isConnected) returnFocus.focus({ preventScroll: true }); };
+  const handleEscape = (event) => { if (event.key === "Escape") close(); };
+  document.addEventListener("keydown", handleEscape);
+  modalRoot.querySelectorAll("[data-creator-close]").forEach((button) => button.addEventListener("click", close));
+  modalRoot.querySelector("[data-modal-backdrop]")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) close(); });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const payload = Object.fromEntries(new FormData(form).entries());
+    if (payload.inputs_json) {
+      try { payload.inputs = JSON.parse(payload.inputs_json); } catch { toast("JSON 格式错误", "请检查工作流输入变量", "error"); return; }
+      delete payload.inputs_json;
+    }
+    payload.ai_generated = payload.ai_generated === "true";
+    close();
+    await runCreatorAction(actionId, payload);
+  });
+  form?.querySelector("input, select, textarea")?.focus();
+}
+
+async function runCreatorAction(actionId, payload) {
+  const extension = activeExtension();
+  if (!extension) return;
+  try {
+    const response = await apiPost("extensions/action", { extension_id: extension.id, action_id: actionId, payload });
+    if (!response?.ok) throw new Error(response?.error?.message || "扩展动作执行失败");
+    const messages = { "create-idea": "灵感已进入雷达", "promote-idea": "灵感已推进为项目", "create-project": "项目已创建", "plan-video": "脚本与分镜计划已保存", "collect-asset": "素材已登记", "run-workflow": "工作流已加入队列", "prepare-submission": "投稿草稿与合规审批已生成", "capture-analytics": "数据快照已保存", "create-retrospective": "复盘已保存", "create-proposal": "提案已进入人工确认", "sync-host-context": "Host 信号已同步", "scan-opportunities": "机会候选已刷新", "decide-approval": "审批决定已记录", "set-stage-policy": "阶段策略已更新", "decide-proposal": "提案决定已记录", "workspace-cleanup": payload.execute ? "工作区清理完成" : "清理预演已生成审批", "request-opportunity-enroll": "参与申请已进入人工确认", "request-upload": payload.approval_id ? "上传动作已交给 Host" : "上传申请已进入人工确认", "request-publish": payload.approval_id ? "发布动作已交给 Host" : "发布申请已进入人工确认", "refresh-host": "Host 状态已刷新" };
+    toast(extension.short_name || extension.name || "扩展已更新", messages[actionId] || "动作已完成");
+    await loadExtensionPage(extension.id, state.extensionPage);
+  } catch (error) {
+    toast("扩展动作未执行", error.message || "请检查扩展配置", "error");
+  }
+}
+
+function bindCreatorContent() {
+  content.querySelectorAll("[data-extension-target]").forEach((node) => node.addEventListener("click", () => navigateExtension(node.dataset.extensionTarget)));
+  content.querySelectorAll("[data-extension-action]").forEach((node) => node.addEventListener("click", () => openCreatorModal(node.dataset.extensionAction, node)));
+  content.querySelectorAll("[data-policy-stage]").forEach((node) => node.addEventListener("change", () => runCreatorAction("set-stage-policy", { stage: node.dataset.policyStage, mode: node.value })));
+  content.querySelector("[data-workspace-cleanup-preview]")?.addEventListener("click", () => {
+    const paths = [...content.querySelectorAll("[data-workspace-path]:checked")].map((node) => node.value);
+    if (!paths.length) return toast("未选择清理项", "请先选择需要预演的临时或孤儿文件", "error");
+    runCreatorAction("workspace-cleanup", { paths, execute: false });
+  });
+  content.querySelectorAll("[data-workspace-cleanup-approval]").forEach((node) => node.addEventListener("click", () => runCreatorAction("workspace-cleanup", { approval_id: node.dataset.workspaceCleanupApproval, execute: true })));
+  content.querySelectorAll("[data-sensitive-action]").forEach((node) => node.addEventListener("click", () => runCreatorAction(node.dataset.sensitiveAction, { approval_id: node.dataset.approvalId })));
+  content.querySelector("[data-extension-retry]")?.addEventListener("click", () => activeExtension() && loadExtensionPage(activeExtension().id, state.extensionPage));
+  content.querySelector("[data-leave-extension]")?.addEventListener("click", leaveExtension);
+}
+
+
 function renderPage(page) {
   return {
     overview: renderOverview,
@@ -761,16 +1377,80 @@ function quotaRow(label, used, total, tone) {
   return `<div class="quota-row"><div><span>${esc(label)}</span><b>${fmt(used)} / ${fmt(total)}</b></div><div class="quota-track tone-${tone}"><i style="width:${percent}%"></i></div></div>`;
 }
 
+function parseInterestReport(report) {
+  const lines = String(report || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const statsLine = lines.find((line) => line.startsWith("统计窗口：")) || "";
+  const stats = statsLine.replace(/^统计窗口：/, "").split("｜").filter(Boolean);
+  const sections = [];
+  let current = null;
+  let note = "";
+  lines.forEach((line) => {
+    const heading = line.match(/^【(.+)】$/);
+    if (heading) {
+      current = { title: heading[1], items: [] };
+      sections.push(current);
+      return;
+    }
+    if (line.startsWith("说明：")) {
+      note = line;
+      current = null;
+      return;
+    }
+    if (current) current.items.push(line.replace(/^[·•-]\s*/, ""));
+  });
+  return { stats, sections, note };
+}
+
+function renderInterestSnapshot() {
+  const snapshot = state.interest || {};
+  const parsed = parseInterestReport(snapshot.report);
+  const sourceLabel = snapshot.stale ? "安全回退" : snapshot.cached ? "30 秒缓存" : "刚刚同步";
+  const sourceTone = snapshot.stale ? "orange" : snapshot.cached ? "violet" : "green";
+  if (!parsed.stats.length && !parsed.sections.length) {
+    return `<div class="interest-snapshot is-empty"><div>${icon("shield")}</div><strong>兴趣状态暂时无法读取</strong><p>${esc(snapshot.error || "回复与主动看片仍会按现有配置继续运行。")}</p></div>`;
+  }
+  return `<div class="interest-snapshot">
+    <div class="interest-snapshot-head">
+      <div><strong>只展示观察结果，不会在这里直接改写偏好</strong><span>当前学习到的视频兴趣</span></div>
+      ${statusPill(sourceLabel, sourceTone)}
+    </div>
+    <div class="interest-stat-row">${parsed.stats.map((item) => `<span>${esc(item)}</span>`).join("")}</div>
+    <div class="interest-insight-grid">${parsed.sections.map((section) => `<article><strong>${esc(section.title)}</strong><div>${section.items.length ? section.items.map((item) => `<p>${esc(item)}</p>`).join("") : `<p>暂无数据</p>`}</div></article>`).join("")}</div>
+    <div class="interest-snapshot-foot"><span>${icon("shield")}只读接口 · 内容已限长并转义 · 不含账号凭据</span><small>${esc(parsed.note || "重复出现的兴趣证据才会逐渐提高选片优先级。")}${snapshot.updated_at ? ` · 更新于 ${esc(snapshot.updated_at)}` : ""}</small></div>
+  </div>`;
+}
+
+function renderInterestConfigSection() {
+  const keys = ["INTEREST_APPLY_TO_PRIVATE", "INTEREST_SELECTION_PROMPT", "CUSTOM_REPLY_INSTRUCTION"].filter(hasKey);
+  if (!keys.length) return "";
+  return `<section class="card section-card interest-config-card">
+    ${sectionHead("兴趣选择与评论提示词", "总开关、当前兴趣和回复提示词集中在这里", "star")}
+    <div class="interest-config-layout">
+      <div class="interest-config-controls">
+        <div class="interest-selector-row">
+          <div><strong>不是每条消息都必须回复</strong><p>先过滤广告、复读和低价值内容，再按兴趣选择真正值得回应的评论和私信。</p></div>
+          ${hasKey("ENABLE_INTEREST_BASED_REPLY") ? renderControl("ENABLE_INTEREST_BASED_REPLY", state.schema.ENABLE_INTEREST_BASED_REPLY) : ""}
+        </div>
+        ${renderFields(keys)}
+      </div>
+      <div class="interest-config-observation">${renderInterestSnapshot()}</div>
+    </div>
+  </section>`;
+}
+
 function renderInteraction() {
   return `${pageHead("INTERACTION", "回复与互动", "把值得回应的内容挑出来，再用明确的频率、冷却和硬上限保护账号。", statusPill(`${fmt(state.stats.filtered_today)} 条已过滤`, "green"))}
-    <section class="feature-banner interest-banner"><div class="feature-icon">${icon("star")}</div><div><span>兴趣选择器</span><h2>不是每条消息都必须回复</h2><p>广告、复读与低价值内容先被硬过滤，再由模型根据管理员提示词挑选真正值得回应的评论和私信。</p></div><div class="feature-control">${hasKey("ENABLE_INTEREST_BASED_REPLY") ? renderControl("ENABLE_INTEREST_BASED_REPLY", state.schema.ENABLE_INTEREST_BASED_REPLY) : ""}</div></section>
     <div class="two-column">
-      ${renderConfigSection("内容筛选", "先做确定性过滤，再执行兴趣判断", ["FILTER_LOW_VALUE_MESSAGES", "FILTER_DUPLICATE_MESSAGES", "FILTER_AD_MESSAGES", "ENABLE_INTEREST_BASED_REPLY", "INTEREST_APPLY_TO_PRIVATE"], "shield")}
+      ${renderConfigSection("内容筛选", "先做确定性过滤，再执行兴趣判断", ["FILTER_LOW_VALUE_MESSAGES", "FILTER_DUPLICATE_MESSAGES", "FILTER_AD_MESSAGES"], "shield")}
       ${renderConfigSection("回复边界", "概率保留为最后一道节奏控制", ["ENABLE_REPLY", "REPLY_PROBABILITY_PERCENT", "REPLY_COOLDOWN", "POLL_INTERVAL", "REPLY_ALWAYS_UIDS", "ENABLE_SIMILAR_SKIP", "REPLY_SIMILARITY_PERCENT"], "controller")}
     </div>
-    ${renderConfigSection("兴趣选择与评论提示词", "兴趣提示词只负责判断是否值得回复；评论补充提示词负责决定怎么回复", ["INTEREST_SELECTION_PROMPT", "CUSTOM_REPLY_INSTRUCTION"], "star")}
+    ${renderInterestConfigSection()}
     <div class="two-column">
-      ${renderConfigSection("B站私信", "只处理安全、有效且满足范围规则的新私信", ["ENABLE_PRIVATE_MESSAGES", "PRIVATE_MESSAGE_REPLY_SCOPE", "PRIVATE_MESSAGE_AUTO_REPLY", "PRIVATE_MESSAGE_AUTO_WATCH_VIDEO", "PRIVATE_MESSAGE_BILI_SEARCH_ENABLED", "PRIVATE_MESSAGE_BILI_SEARCH_LIMIT", "PRIVATE_MESSAGE_REPLY_WHITELIST_UIDS", "PRIVATE_MESSAGE_MAX_PER_POLL", "PRIVATE_MESSAGE_MAX_MESSAGE_AGE", "CUSTOM_PRIVATE_MESSAGE_INSTRUCTION"], "user")}
+      ${renderConfigSection("B站私信回复", "先决定回复对象，再设置回复方式与人设补充", ["ENABLE_PRIVATE_MESSAGES", "PRIVATE_MESSAGE_REPLY_SCOPE", "PRIVATE_MESSAGE_REPLY_WHITELIST_UIDS", "PRIVATE_MESSAGE_AUTO_REPLY", "CUSTOM_PRIVATE_MESSAGE_INSTRUCTION"], "user")}
+      ${renderConfigSection("B站私信轮询", "集中管理请求节奏、活跃窗口和单轮处理边界", ["PRIVATE_MESSAGE_POLL_INTERVAL", "PRIVATE_MESSAGE_IDLE_POLL_INTERVAL", "PRIVATE_MESSAGE_ACTIVE_WINDOW", "PRIVATE_MESSAGE_MAX_PER_POLL", "PRIVATE_MESSAGE_MAX_MESSAGE_AGE"], "clock")}
+    </div>
+    <div class="two-column">
+      ${renderConfigSection("B站私信视频与查询", "收到分享后可看视频、查 UP 主或公开视频，并控制再次分享的冷却", ["PRIVATE_MESSAGE_AUTO_WATCH_VIDEO", "PRIVATE_MESSAGE_BILI_SEARCH_ENABLED", "PRIVATE_MESSAGE_BILI_SEARCH_LIMIT", "BILI_PRIVATE_SHARE_TOOL_ENABLED", "BILI_PRIVATE_SHARE_COOLDOWN"], "search")}
       ${renderConfigSection("直播间弹幕互动", "进入指定 UP 主直播间，监听公开弹幕并由 Bot 的B站账号参与互动；同时限制发送速度与长度，避免抢话和刷屏", ["ENABLE_LIVE_DANMAKU_REPLY", "LIVE_DANMAKU_ROOM_ID", "LIVE_DANMAKU_POLL_INTERVAL", "LIVE_DANMAKU_REPLY_COOLDOWN", "LIVE_DANMAKU_MAX_PER_MINUTE", "LIVE_DANMAKU_REPLY_MAX_LENGTH", "CUSTOM_LIVE_DANMAKU_INSTRUCTION"], "video")}
     </div>
     ${renderConfigSection("分享解析", "统一管理自动识别、手动触发和视频切片限制", ["ENABLE_BILI_SHARE_PARSE", "BILI_SHARE_PARSE_AUTO_TRIGGER_ENABLED", "BILI_SHARE_PARSE_MANUAL_TRIGGER_ENABLED", "BILI_SHARE_PARSE_LLM_TRIGGER_ENABLED", "BILI_SHARE_PENDING_MAX_AGE", "BILI_SHARE_PARSE_SEND_VIDEO", "BILI_SHARE_PARSE_SEGMENT_SECONDS", "BILI_SHARE_PARSE_MAX_SEGMENTS", "BILI_SHARE_PARSE_MAX_VIDEO_MB", "BILI_SHARE_PARSE_VIDEO_MAX_HEIGHT", "BILI_SHARE_PARSE_COOLDOWN"], "search")}`;
@@ -787,7 +1467,7 @@ const EVENT_STYLES = {
 
 const AUTONOMY_CAPABILITIES = [
   { id: "plan-generation", title: "每日计划编排", icon: "calendar", toggle: "ENABLE_AUTONOMOUS_DAILY_PLAN", description: "决定由模型安排今天的事件，或切换到管理员固定计划。", keys: ["AUTONOMOUS_PLAN_GENERATION_MODE", "AUTONOMOUS_PLAN_AFTER_SLEEP_MINUTES", "AUTONOMOUS_PLAN_GENERATION_TIME", "AUTONOMOUS_PLAN_RETRY_MINUTES", "AUTONOMOUS_PROACTIVE_WINDOW_MINUTES", "AUTONOMOUS_PLAN_PROMPT"] },
-  { id: "proactive", title: "主动浏览", icon: "play", toggle: "ENABLE_PROACTIVE", description: "在主动浏览时间段内观看视频，并执行受评分阈值保护的互动。", keys: ["PROACTIVE_VIDEO_COUNT", "PROACTIVE_DAILY_LIMIT", "PROACTIVE_COMMENT_COUNT", "VIDEO_VISUAL_ANALYSIS_POLICY", "VIDEO_CACHE_TTL_MINUTES", "ENABLE_VIDEO_LONG_TERM_MEMORY"] },
+  { id: "proactive", title: "主动浏览", icon: "play", toggle: "ENABLE_PROACTIVE", description: "在主动浏览时间段内观看视频，并执行受评分阈值保护的互动。", keys: ["PROACTIVE_TIMES_COUNT", "PROACTIVE_VIDEO_COUNT", "PROACTIVE_DAILY_LIMIT", "PROACTIVE_COMMENT_COUNT", "PROACTIVE_COMMENT_DAILY_LIMIT", "VIDEO_VISUAL_ANALYSIS_POLICY", "ENABLE_VIDEO_LONG_TERM_MEMORY", "VIDEO_MEMORY_DETAIL_DAYS", "VIDEO_MEMORY_FADE_DAYS"] },
   { id: "dynamic", title: "动态发布", icon: "message", toggle: "ENABLE_DYNAMIC", description: "按今日计划生成并发布 B站动态；时间由固定计划或自主计划统一安排。", keys: ["DYNAMIC_TOPICS", "CUSTOM_DYNAMIC_INSTRUCTION"] },
   { id: "dynamic-watch", title: "关注动态", icon: "search", toggle: "ENABLE_DYNAMIC_WATCH", description: "查看关注用户的新动态图文与视频投稿，触发节奏由统一日程管理。", keys: ["DYNAMIC_WATCH_DAILY_LIMIT", "DYNAMIC_WATCH_SPECIAL_ONLY", "DYNAMIC_WATCH_INCLUDE_VIDEO_POSTS", "DYNAMIC_WATCH_INTEREST_PROMPT"] },
   { id: "special-follow", title: "特别关注", icon: "star", toggle: "SPECIAL_FOLLOW_ENABLED", description: "巡视特别关注用户；不在此处重复设置固定时刻或触发次数。", keys: [] },
@@ -880,7 +1560,7 @@ function eventPhase(event, nowMinute = currentMinuteOfDay()) {
 function eventPhaseMeta(event) {
   const phase = eventPhase(event);
   if (phase === "done") return { phase, label: "已完成", detail: "已按计划执行" };
-  if (phase === "overdue") return { phase, label: "已错过", detail: "时段触发时刻已过，等待补执行或重新生成" };
+  if (phase === "overdue") return { phase, label: "已错过", detail: "触发窗口已过，今天不会补执行" };
   if (phase === "invalid") return { phase, label: "时间无效", detail: "请修正该事件的执行时刻后保存" };
   return { phase, label: "待执行", detail: "等待计划时刻" };
 }
@@ -966,7 +1646,7 @@ function renderSelectedEvent(events) {
   if (!event) {
     const next = nextScheduleEvent(events);
     const style = EVENT_STYLES[next?.kind] || EVENT_STYLES.proactive;
-    return `<div id="selected-event" class="selected-event is-next" style="--a:${style.gradient[0]};--b:${style.gradient[1]}"><span class="selected-event-icon">${icon(next ? style.icon : "clock")}</span><div><span>${next ? "下一执行" : "今日进度"}</span><h3>${next?.time ? `${esc(next.time)} · ${esc(next.label || style.label)}` : "今日暂无后续事件"}</h3><p>${esc(next?.description || "过去未完成的事件会标记为已错过，可重新生成计划或等待补执行。")}</p></div></div>`;
+    return `<div id="selected-event" class="selected-event is-next" style="--a:${style.gradient[0]};--b:${style.gradient[1]}"><span class="selected-event-icon">${icon(next ? style.icon : "clock")}</span><div><span>${next ? "下一执行" : "今日进度"}</span><h3>${next?.time ? `${esc(next.time)} · ${esc(next.label || style.label)}` : "今日暂无后续事件"}</h3><p>${esc(next?.description || "过去未完成的事件会标记为已错过，不会在稍后补执行。")}</p></div></div>`;
   }
   const style = EVENT_STYLES[event.kind] || EVENT_STYLES.proactive;
   const meta = eventPhaseMeta(event);
@@ -992,28 +1672,27 @@ function renderBehaviorMatrix() {
 
 function renderPlanStatus(plan, autonomous) {
   const failed = autonomous && plan.generation_status === "error";
-  const status = failed ? "模型调用失败，当前使用安全 fallback" : autonomous ? "模型计划已通过范围边界校验" : "管理员固定计划";
+  const status = failed ? "今日模型计划未生成，不新增自动事件" : autonomous ? "模型计划已通过安全上限校验" : "管理员固定计划";
   const detail = failed
-    ? `${plan.model_error || "未配置模型提供商，或 AI 对话总开关未开启。"} 请检查模型提供商和 AI 对话总开关。`
+    ? `${plan.model_error || "计划模型暂时没有返回有效内容。"} 可稍后重新生成；评论、私信等功能仍按各自开关运行。`
     : plan.rationale || (autonomous ? "保存修改后调用当前模型生成当天计划。" : "保存修改后按准确时刻刷新当天计划。");
   return `<div class="plan-status ${failed ? "has-error" : autonomous ? "is-model" : "is-fixed"}"><span>${icon(failed ? "lightning" : autonomous ? "star" : "clock")}</span><div><strong>${esc(status)}</strong><p>${esc(detail)}</p></div>${plan.generated_at ? `<small>${esc(plan.generated_at)}</small>` : ""}</div>`;
 }
 
-function renderAdminRangeRow(label, minKey, maxKey, unit) {
-  const minimum = num(currentValue(minKey), 0);
+function renderAdminCapRow(label, maxKey, unit) {
   const maximum = num(currentValue(maxKey), 0);
-  return `<div class="admin-range-row"><div class="admin-range-label"><strong>${esc(label)}</strong><small>${esc(unit)}</small></div><div class="admin-range-control"><div class="range-number"><button type="button" data-step-key="${minKey}" data-step-dir="-1" aria-label="减少${esc(label)}下限">−</button><input data-config-key="${minKey}" data-range-bound="min" type="number" min="0" max="${Math.max(maximum, 1)}" step="1" value="${minimum}" aria-label="${esc(label)}下限" /><button type="button" data-step-key="${minKey}" data-step-dir="1" aria-label="增加${esc(label)}下限">＋</button></div><span class="range-dash">—</span><div class="range-number"><button type="button" data-step-key="${maxKey}" data-step-dir="-1" aria-label="减少${esc(label)}上限">−</button><input data-config-key="${maxKey}" data-range-bound="max" type="number" min="${minimum}" max="999" step="1" value="${maximum}" aria-label="${esc(label)}上限" /><button type="button" data-step-key="${maxKey}" data-step-dir="1" aria-label="增加${esc(label)}上限">＋</button></div><span class="range-unit">${esc(unit)}</span></div></div>`;
+  return `<div class="admin-range-row"><div class="admin-range-label"><strong>${esc(label)}</strong><small>只限制最多执行多少${esc(unit)}</small></div><div class="admin-range-control"><div class="range-number"><button type="button" data-step-key="${maxKey}" data-step-dir="-1" aria-label="减少${esc(label)}上限">−</button><input data-config-key="${maxKey}" data-range-bound="max" type="number" min="0" max="999" step="1" value="${maximum}" aria-label="${esc(label)}上限" /><button type="button" data-step-key="${maxKey}" data-step-dir="1" aria-label="增加${esc(label)}上限">＋</button></div><span class="range-unit">${esc(unit)}</span></div></div>`;
 }
 
 function renderAdminRanges() {
   const rows = [
-    ["每日评论回复", "AUTONOMOUS_REPLY_DAILY_MIN", "AUTONOMOUS_REPLY_DAILY_MAX", "次"],
-    ["每日私信回复", "AUTONOMOUS_PRIVATE_DAILY_MIN", "AUTONOMOUS_PRIVATE_DAILY_MAX", "次"],
-    ["主动浏览轮次", "AUTONOMOUS_PROACTIVE_DAILY_MIN", "AUTONOMOUS_PROACTIVE_DAILY_MAX", "轮"],
-    ["每日发布动态", "AUTONOMOUS_DYNAMIC_DAILY_MIN", "AUTONOMOUS_DYNAMIC_DAILY_MAX", "条"],
+    ["每日评论回复上限", "AUTONOMOUS_REPLY_DAILY_MAX", "次"],
+    ["每日私信回复上限", "AUTONOMOUS_PRIVATE_DAILY_MAX", "次"],
+    ["主动浏览轮次上限", "AUTONOMOUS_PROACTIVE_DAILY_MAX", "轮"],
+    ["每日发布动态上限", "AUTONOMOUS_DYNAMIC_DAILY_MAX", "条"],
   ];
-  const summary = rows.map(([label, minKey, maxKey, unit]) => `${label.replace("每日", "")} ${fmt(currentValue(minKey))}-${fmt(currentValue(maxKey))}${unit}`).join(" · ");
-  return `<details class="admin-range-details"><summary><span><strong>管理员范围限制</strong><small>${esc(summary)}</small></span><i>${icon("arrow-right")}</i></summary><div class="admin-range-list">${rows.map((row) => renderAdminRangeRow(...row)).join("")}<p class="admin-range-hint">下限不能大于上限；主动浏览的数量是时间段轮次，每轮视频数量与每日视频总数仍单独控制。</p></div></details>`;
+  const summary = rows.map(([label, maxKey, unit]) => `${label.replace("每日", "")} ${fmt(currentValue(maxKey))}${unit}`).join(" · ");
+  return `<details class="admin-range-details"><summary><span><strong>管理员安全上限</strong><small>${esc(summary)}</small></span><i>${icon("arrow-right")}</i></summary><div class="admin-range-list">${rows.map((row) => renderAdminCapRow(...row)).join("")}<p class="admin-range-hint">所有数字都只是安全上限，不是必须完成的目标。主动浏览轮次、每轮视频数、每日视频总数和主动评论上限分别控制。</p></div></details>`;
 }
 
 function renderAutonomousTemplate(plan, autonomous, events) {
@@ -1023,8 +1702,8 @@ function renderAutonomousTemplate(plan, autonomous, events) {
     <div class="plan-facts">
       <div><span>今日事件</span><strong>${events.length}</strong><small>只来自已启用能力</small></div>
       <div><span>下一事件</span><strong>${next?.time ? esc(next.time) : "—"}</strong><small>${esc(next?.label || "暂无待执行事件")}</small></div>
-      <div><span>评论 / 私信目标</span><strong>${fmt(plan.reply_target)} / ${fmt(plan.private_target)}</strong><small>模型目标仍受上下限保护</small></div>
-      <div><span>计划来源</span><strong>${plan.source === "fallback" ? "安全回退" : "当前模型"}</strong><small>仅保存时更新当天计划</small></div>
+      <div><span>评论 / 私信上限</span><strong>${fmt(plan.reply_cap ?? plan.reply_target)} / ${fmt(plan.private_cap ?? plan.private_target)}</strong><small>只在有真实消息时回复，不要求用完</small></div>
+      <div><span>计划来源</span><strong>${plan.generation_status === "error" ? "无新增事件" : "当前模型"}</strong><small>仅保存时更新当天计划</small></div>
     </div>
     ${renderConfigSection("自主计划提示词", "作为 B站每日安排的附加提示，不会替换 AstrBot 原人设", ["AUTONOMOUS_PLAN_PROMPT"], "star", "", "embedded-section")}
   </section>`;
@@ -1034,7 +1713,7 @@ function renderFixedTemplate(plan, autonomous) {
   const exactKeys = ["FIXED_PROACTIVE_WINDOWS", "FIXED_DYNAMIC_TIMES", "FIXED_DYNAMIC_WATCH_TIMES", "FIXED_BANGUMI_TIMES", "FIXED_SPECIAL_FOLLOW_TIMES"];
   return `<section class="plan-template fixed-template ${autonomous ? "" : "is-active"}" data-plan-template="fixed" aria-hidden="${autonomous}" ${autonomous ? "inert" : ""}>
     ${renderPlanStatus(plan, false)}
-    <div class="fixed-target-grid">${["FIXED_REPLY_DAILY_TARGET", "FIXED_PRIVATE_DAILY_TARGET", "SLEEP_START", "SLEEP_END", "AUTONOMOUS_MIN_ACTION_GAP_MINUTES"].map((key) => renderField(key, { tile: true })).join("")}</div>
+    <div class="fixed-target-grid">${["SLEEP_START", "SLEEP_END", "AUTONOMOUS_MIN_ACTION_GAP_MINUTES"].map((key) => renderField(key, { tile: true })).join("")}</div>
     <section class="embedded-section fixed-times-section">${sectionHead("准确执行时刻", "对应能力关闭时，该行时刻不会进入事件环；每个时间都可直接选择", "calendar")}<div class="fixed-times-grid">${exactKeys.map((key) => renderField(key, { tile: true })).join("")}</div></section>
   </section>`;
 }
@@ -1050,7 +1729,7 @@ function renderPlanModeCard(plan, autonomous, events) {
 function capabilitySummary(item) {
   if (!currentValue(item.toggle)) return "总开关已关闭，不会生成相关事件";
   if (item.id === "plan-generation") return currentValue("ENABLE_AUTONOMOUS_DAILY_PLAN") ? `每日计划：${currentValue("AUTONOMOUS_PLAN_GENERATION_MODE") === "fixed_time" ? currentValue("AUTONOMOUS_PLAN_GENERATION_TIME") : `休眠后 ${fmt(currentValue("AUTONOMOUS_PLAN_AFTER_SLEEP_MINUTES"))} 分钟`}` : "当前使用固定计划";
-  if (item.id === "proactive") return `时间段内最多 ${fmt(currentValue("PROACTIVE_DAILY_LIMIT"))} 轮 · 每轮 ${fmt(currentValue("PROACTIVE_VIDEO_COUNT"))} 个视频`;
+  if (item.id === "proactive") return `每天最多 ${fmt(currentValue("PROACTIVE_TIMES_COUNT"))} 轮 · 每轮 ${fmt(currentValue("PROACTIVE_VIDEO_COUNT"))} 个 · 全天视频上限 ${num(currentValue("PROACTIVE_DAILY_LIMIT"), 0) > 0 ? fmt(currentValue("PROACTIVE_DAILY_LIMIT")) : "不限"}`;
   if (item.id === "owner-share") return `最低 ${fmt(currentValue("RECOMMEND_OWNER_MIN_SCORE"))} 分 · 每天最多 ${fmt(currentValue("RECOMMEND_OWNER_DAILY_LIMIT"))} 次`;
   if (item.id === "dynamic") return "时间由统一日程管理";
   if (item.id === "dynamic-watch") return `每天最多 ${fmt(currentValue("DYNAMIC_WATCH_DAILY_LIMIT"))} 次 · 包含视频投稿 ${currentValue("DYNAMIC_WATCH_INCLUDE_VIDEO_POSTS") ? "开启" : "关闭"}`;
@@ -1135,6 +1814,7 @@ function renderAutonomy() {
       <aside class="schedule-side"><article class="card event-card">${sectionHead("今日事件", `${completedCount} 已完成 · ${upcomingCount} 待执行${overdueCount ? ` · ${overdueCount} 已错过` : ""}${invalidCount ? ` · ${invalidCount} 时间无效` : ""}`, "calendar")}${renderSelectedEvent(events)}${renderEventList(events)}${renderBeginnerGuide()}</article></aside>
     </section>
     ${renderPlanModeCard(plan, autonomous, events)}
+    ${renderConfigSection("全局行为预算与超时", "评论、私信、主动看片和直播共用最后一道总量保护；这里不负责重复重试", ["BEHAVIOR_BUDGET_ENABLED", "BEHAVIOR_GLOBAL_MAX_PER_MINUTE", "BEHAVIOR_GLOBAL_DAILY_LIMIT", "BEHAVIOR_ACTION_TIMEOUT_SECONDS"], "shield")}
     <section class="card section-card behavior-section">${sectionHead("主动行为评分", "管理员决定每个动作的最低内容评分；模型意愿不能绕过阈值", "controller")}${renderBehaviorMatrix()}</section>
     <section class="card capability-section">${sectionHead("主动能力总开关", "先决定是否允许这类行为，再进入独立子界面设置细节；关闭后不会生成对应日程", "controller")}${renderCapabilityCards()}</section>`;
 }
@@ -1220,14 +1900,24 @@ function renderAccount() {
     ${renderConfigSection("主人身份", "用于私信推荐、@主人和安全的跨平台记忆共享校验", ["OWNER_MID", "OWNER_NAME", "OWNER_BILI_NAME"], "heart")}`;
 }
 
-const BASIC_GROUP_ORDER = ["人设与模型", "性格演化", "Embedding 与记忆", "视频与图片视觉", "图片生成", "联网搜索", "总结", "Cookie 与系统", "高级接口"];
+const BASIC_GROUP_ORDER = ["人设与模型", "Embedding 与记忆", "视频分析", "图片识别", "联网搜索", "图片生成", "总结", "性格演化", "Cookie 与系统", "高级接口"];
+
+const BASIC_KEY_ORDER = {
+  "人设与模型": ["USE_ASTRBOT_PERSONA", "CUSTOM_SYSTEM_PROMPT", "LLM_PROVIDER_ID", "LLM_CIRCUIT_FAILURE_THRESHOLD", "LLM_CIRCUIT_COOLDOWN_SECONDS"],
+  "Embedding 与记忆": ["EMBED_API_KEY", "EMBED_API_BASE", "EMBED_MODEL", "EMBED_TIMEOUT_SECONDS"],
+  "视频分析": ["VIDEO_VISION_PROVIDER_ID", "VIDEO_VISION_API_KEY", "VIDEO_VISION_API_BASE", "VIDEO_VISION_MODEL", "VIDEO_VISION_FORMAT", "VIDEO_VISION_FPS"],
+  "图片识别": ["IMAGE_VISION_PROVIDER_ID", "IMAGE_VISION_API_KEY", "IMAGE_VISION_API_BASE", "IMAGE_VISION_MODEL"],
+  "联网搜索": ["ENABLE_WEB_SEARCH", "WEB_SEARCH_BACKEND", "WEB_SEARCH_API_KEY", "WEB_SEARCH_API_BASE", "WEB_SEARCH_MODEL", "WEB_SEARCH_JUDGE_PROVIDER_ID", "WEB_SEARCH_MAX_RESULTS"],
+  "图片生成": ["IMAGE_GEN_BACKEND", "IMAGE_GEN_API_KEY", "IMAGE_GEN_API_BASE", "IMAGE_GEN_MODEL", "IMAGE_GEN_WIDTH", "IMAGE_GEN_HEIGHT", "IMAGE_GEN_STEPS", "IMAGE_GEN_SCALE", "IMAGE_GEN_SAMPLER", "IMAGE_GEN_NEGATIVE_PROMPT"],
+};
 
 function basicGroupFor(key, field) {
   const group = descriptionMeta(field).group;
-  if (/人设/.test(group) || ["LLM_PROVIDER_ID", "USE_ASTRBOT_PERSONA", "CUSTOM_SYSTEM_PROMPT"].includes(key)) return "人设与模型";
+  if (/人设|模型可靠性/.test(group) || ["LLM_PROVIDER_ID", "USE_ASTRBOT_PERSONA", "CUSTOM_SYSTEM_PROMPT", "LLM_CIRCUIT_FAILURE_THRESHOLD", "LLM_CIRCUIT_COOLDOWN_SECONDS"].includes(key)) return "人设与模型";
   if (/性格演化/.test(group) || key.startsWith("EVOLVE_")) return "性格演化";
   if (/高级·记忆/.test(group) || key.startsWith("EMBED_")) return "Embedding 与记忆";
-  if (/视觉|视频分析/.test(group) || /VISION/.test(key)) return "视频与图片视觉";
+  if (key.startsWith("VIDEO_VISION_") || /视频分析/.test(group)) return "视频分析";
+  if (key.startsWith("IMAGE_VISION_")) return "图片识别";
   if (/图片生成/.test(group) || key.startsWith("IMAGE_GEN_")) return "图片生成";
   if (/联网搜索/.test(group) || key.startsWith("WEB_SEARCH_")) return "联网搜索";
   if (/总结/.test(group) || key.includes("DAILY") || key.includes("WEEKLY")) return "总结";
@@ -1263,6 +1953,17 @@ function renderBasics() {
     const group = basicGroupFor(key, field);
     if (group) groups[group].push(key);
   });
+  Object.entries(groups).forEach(([name, keys]) => {
+    const preferred = BASIC_KEY_ORDER[name] || [];
+    keys.sort((left, right) => {
+      const leftIndex = preferred.indexOf(left);
+      const rightIndex = preferred.indexOf(right);
+      if (leftIndex < 0 && rightIndex < 0) return 0;
+      if (leftIndex < 0) return 1;
+      if (rightIndex < 0) return -1;
+      return leftIndex - rightIndex;
+    });
+  });
   return `${pageHead("FOUNDATION", "基础设置", "这里只保留完成初始化后很少需要调整的人设、模型和高级能力；常用行为已拆到对应页面。")}
     ${renderCacheCard()}
     <section class="settings-search card"><span>${icon("search")}</span><input id="settings-search" type="search" value="${esc(state.settingsSearch)}" placeholder="搜索配置名称、说明或 KEY" aria-label="搜索基础设置" />${state.settingsSearch ? `<button data-action="clear-settings-search" type="button">清除</button>` : ""}</section>
@@ -1270,8 +1971,8 @@ function renderBasics() {
     <div class="accordion-list">${BASIC_GROUP_ORDER.map((name, index) => {
       const keys = groups[name];
       if (!keys.length) return "";
-      const iconName = { "人设与模型": "heart", "性格演化": "star", "Embedding 与记忆": "memory-card", "视频与图片视觉": "video", "图片生成": "sun", "联网搜索": "search", "总结": "calendar", "Cookie 与系统": "settings", "高级接口": "controller" }[name] || "settings";
-      const evolutionToggle = name === "性格演化" && hasKey("ENABLE_PERSONALITY_EVOLUTION") ? `<div class="settings-inline-toggle"><div><strong>性格演化总开关</strong><small>关闭后下方性格演化设置不生效，已有数据会保留。</small></div>${renderControl("ENABLE_PERSONALITY_EVOLUTION", state.schema.ENABLE_PERSONALITY_EVOLUTION)}</div>` : "";
+      const iconName = { "人设与模型": "heart", "性格演化": "star", "Embedding 与记忆": "memory-card", "视频分析": "video", "图片识别": "sun", "图片生成": "sun", "联网搜索": "search", "总结": "calendar", "Cookie 与系统": "settings", "高级接口": "controller" }[name] || "settings";
+      const evolutionToggle = name === "性格演化" && hasKey("ENABLE_PERSONALITY_EVOLUTION") ? `<div class="settings-inline-toggle"><div><strong>旧版每日性格演化</strong><small>实验性功能，建议先关闭并积累几天真实反馈；已有数据会保留。</small></div>${renderControl("ENABLE_PERSONALITY_EVOLUTION", state.schema.ENABLE_PERSONALITY_EVOLUTION)}</div>` : "";
       const evolutionKeys = name === "性格演化" ? keys.filter((key) => key !== "ENABLE_PERSONALITY_EVOLUTION") : keys;
       return `<details class="settings-group card" ${query || index < 2 ? "open" : ""}><summary><span class="section-icon">${icon(iconName)}</span><div><strong>${esc(name)}</strong><small>${evolutionKeys.length + (evolutionToggle ? 1 : 0)} 项配置</small></div>${icon("arrow-right")}</summary><div class="settings-group-body"><div class="settings-group-inner">${evolutionToggle}${renderFields(evolutionKeys)}</div></div></details>`;
     }).join("") || `<div class="card empty-search">${icon("search")}<strong>没有匹配的配置</strong><span>换一个关键词试试。</span></div>`}</div>`;
@@ -1489,7 +2190,7 @@ async function handleAction(action, source = null) {
   }
   if (action === "generate-qr") return generateQr();
   if (action === "regenerate-schedule") {
-    const ok = await confirmModal("重新生成今日计划", "这会清空今天尚未完成的日程并立即根据当前活跃度与范围限制重新生成。", "重新生成");
+    const ok = await confirmModal("重新生成今日计划", "这会清空今天尚未完成的日程并立即根据当前活跃度与安全上限重新生成。", "重新生成");
     if (!ok) return;
     const regenerated = await apiPost("schedule/regenerate", {});
     state.schedule = { ...state.schedule, ...(regenerated || {}) };
@@ -1497,9 +2198,9 @@ async function handleAction(action, source = null) {
     renderCurrentPage();
     const plan = regenerated?.autonomous_plan;
     if (plan?.generation_status === "error") {
-      toast("计划已生成，但模型调用失败", `${plan.model_error || "未配置模型提供商，或 AI 对话总开关未开启。"} 已使用安全 fallback。`, "error");
+      toast("今天不新增自动事件", `${plan.model_error || "计划模型暂时没有返回有效内容。"} 可稍后重新生成。`, "error");
     } else {
-      toast("今日计划已更新", "新计划已经过睡眠区间、最小间隔与范围限制校验");
+      toast("今日计划已更新", "新计划已经过睡眠区间、最小间隔与安全上限校验");
     }
     return;
   }
@@ -1551,6 +2252,11 @@ async function refreshAndRender(page, message) {
 
 async function refreshCurrent() {
   try {
+    if (state.mode === "extension") {
+      const extension = activeExtension();
+      if (extension) await loadExtensionPage(extension.id, state.extensionPage);
+      return;
+    }
     await refreshPageData(state.currentPage);
     renderSidebar();
     renderCurrentPage();
@@ -1613,7 +2319,7 @@ async function saveDraft() {
     if (scheduleError) {
       toast("保存未完成", scheduleError.message || "日程修改未写入，请检查时间间隔", "error");
     } else if (regeneratedPlan?.generation_status === "error") {
-      toast("配置已保存，模型调用失败", `${regeneratedPlan.model_error || "未配置模型提供商，或 AI 对话总开关未开启。"} 已使用安全 fallback；系统会按重试间隔再次调用。`, "error");
+      toast("配置已保存，并启用安全计划", `${regeneratedPlan.model_error || "计划模型暂时没有返回有效内容。"} 系统会按重试间隔再次尝试。`, "error");
     } else if (refreshSchedule || scheduleNeedsSave) {
       toast("配置与今日计划已更新", `已保存 ${keys.length + (scheduleNeedsSave ? 1 : 0)} 项修改`);
     } else {
@@ -1799,6 +2505,11 @@ function init() {
   if (mobileMenu) mobileMenu.innerHTML = icon("menu");
   mobileMenu?.addEventListener("click", openMobileNav);
   document.querySelector("#sidebar-scrim")?.addEventListener("click", closeMobileNav);
+  window.addEventListener("pointermove", (event) => {
+    if (state.mode !== "extension" || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    app.style.setProperty("--creator-pointer-x", `${event.clientX}px`);
+    app.style.setProperty("--creator-pointer-y", `${event.clientY}px`);
+  }, { passive: true });
   window.addEventListener("beforeunload", (event) => {
     if (state.dirtyKeys.size || state.scheduleDirty) {
       event.preventDefault();

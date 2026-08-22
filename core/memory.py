@@ -16,6 +16,9 @@ from .config import (
     THREAD_COMPRESS_THRESHOLD,
     OID_COMPRESS_THRESHOLD, OID_KEEP_RECENT,
     USER_MEMORY_COMPRESS_THRESHOLD, USER_MEMORY_KEEP_RECENT,
+    USER_PROFILE_FILE,
+    WATCH_LOG_FILE, COMMENTED_FILE, VIDEO_MEMORY_FILE, EXTERNAL_MEMORY_FILE,
+    SEEN_VIDEOS_FILE,
 )
 
 
@@ -53,6 +56,54 @@ class MemoryMixin:
             except ValueError:
                 continue
         return datetime.now().timestamp()
+
+    def _video_memory_windows(self):
+        config = getattr(self, "config", {}) or {}
+        try:
+            detail_days = max(1, min(60, int(config.get("VIDEO_MEMORY_DETAIL_DAYS", 15) or 15)))
+        except (TypeError, ValueError):
+            detail_days = 15
+        try:
+            fade_days = max(30, min(730, int(config.get("VIDEO_MEMORY_FADE_DAYS", 90) or 90)))
+        except (TypeError, ValueError):
+            fade_days = 90
+        return detail_days, max(detail_days, fade_days)
+
+    def _video_memory_stage_at(self, record, now_ts=None):
+        """Return detail/long_term/faded without mutating the memory."""
+        explicit = str(record.get("video_memory_stage") or "").strip()
+        if explicit == "faded":
+            return "faded"
+        created_at = self._memory_timestamp(
+            record.get("created_at") or record.get("time")
+        )
+        detail_days, fade_days = self._video_memory_windows()
+        current = float(now_ts if now_ts is not None else datetime.now().timestamp())
+        try:
+            detail_until = float(record.get("video_detail_until"))
+        except (TypeError, ValueError, OverflowError):
+            detail_until = created_at + detail_days * 86400
+        try:
+            fade_after = float(record.get("video_fade_after"))
+        except (TypeError, ValueError, OverflowError):
+            fade_after = created_at + fade_days * 86400
+        fade_after = max(detail_until, fade_after)
+        if current >= fade_after:
+            return "faded"
+        if current >= detail_until:
+            return "long_term"
+        return explicit if explicit in {"detail", "long_term"} else "detail"
+
+    def _memory_recall_weight(self, record):
+        """Reduce unsolicited recall of older video memories."""
+        if self._normalize_memory_entry(record).get("memory_type") != "video":
+            return 1.0
+        return {
+            "detail": 1.0,
+            "long_term": 0.68,
+            # 三个月后只在高度相关时偶尔浮现；永久 BV 去重由 seen_videos 独立负责。
+            "faded": 0.52,
+        }.get(self._video_memory_stage_at(record), 1.0)
 
     def _prepare_memory_entry(self, record):
         rec = self._normalize_memory_entry(record)
@@ -101,6 +152,20 @@ class MemoryMixin:
                 platform = "qq" if scope.startswith("qq_") else "bili"
                 rec["actor_id"] = f"{platform}:{uid}"
         rec["created_at"] = self._memory_timestamp(rec.get("created_at") or rec.get("time"))
+        if memory_type == "video":
+            detail_days, fade_days = self._video_memory_windows()
+            rec.setdefault("video_detail_until", rec["created_at"] + detail_days * 86400)
+            rec.setdefault("video_fade_after", rec["created_at"] + fade_days * 86400)
+            rec.setdefault("video_memory_stage", self._video_memory_stage_at(rec))
+            trace = str(
+                rec.get("video_summary")
+                or rec.get("summary")
+                or rec.get("review")
+                or rec.get("text")
+                or ""
+            ).strip()
+            if trace:
+                rec.setdefault("video_summary", trace[:180].rstrip())
         promoted_at = rec.get("promoted_at")
         if promoted_at and not rec.get("promoted_at_ts"):
             rec["promoted_at_ts"] = self._memory_timestamp(promoted_at)
@@ -166,6 +231,180 @@ class MemoryMixin:
         )
         return True
 
+    def _legacy_seen_video_records(self):
+        """Collect all old, possibly capped sources for one-time permanent import."""
+        records = []
+
+        def add(bvid, item=None, source="legacy"):
+            data = item if isinstance(item, dict) else {}
+            key = str(bvid or data.get("bvid") or "").strip()
+            if len(key) < 4 or key[:2].lower() != "bv":
+                return
+            first_seen = self._memory_timestamp(
+                data.get("first_seen_at")
+                or data.get("time")
+                or data.get("watched_at")
+            )
+            last_related = self._memory_timestamp(
+                data.get("last_related_at")
+                or data.get("time")
+                or data.get("watched_at")
+            )
+            records.append(
+                {
+                    "bvid": "BV" + key[2:],
+                    "first_seen_at": min(first_seen, last_related),
+                    "last_related_at": max(first_seen, last_related),
+                    "title": data.get("title", ""),
+                    "owner_mid": data.get("owner_mid") or data.get("up_mid", ""),
+                    "owner_name": data.get("owner_name") or data.get("up_name", ""),
+                    "tname": data.get("tname", ""),
+                    "source": data.get("source") or source,
+                }
+            )
+
+        watch_log = self._load_json(WATCH_LOG_FILE, [])
+        for item in (watch_log if isinstance(watch_log, list) else []):
+            if isinstance(item, dict):
+                add(item.get("bvid"), item, "watch_log")
+        commented = self._load_json(COMMENTED_FILE, [])
+        for item in (
+            commented if isinstance(commented, (list, tuple, set)) else []
+        ):
+            if isinstance(item, dict):
+                add(item.get("bvid"), item, "commented")
+            else:
+                add(item, source="commented")
+        video_memory = self._load_json(VIDEO_MEMORY_FILE, {})
+        for bvid, item in (
+            video_memory.items() if isinstance(video_memory, dict) else []
+        ):
+            add(bvid, item, "video_memory")
+        external_memory = self._load_json(EXTERNAL_MEMORY_FILE, {})
+        for bvid, item in (
+            external_memory.items() if isinstance(external_memory, dict) else []
+        ):
+            add(bvid, item, "external_memory")
+        seen_backup = self._load_json(SEEN_VIDEOS_FILE, {})
+        for bvid, item in (
+            seen_backup.items() if isinstance(seen_backup, dict) else []
+        ):
+            add(bvid, item, "seen_backup")
+        for item in self._memory:
+            if self._match_memory_type(item, {"video"}):
+                add(item.get("bvid"), item, "semantic_memory")
+        return records
+
+    async def _initialize_seen_videos(self):
+        """Idempotently migrate every legacy BV source into the permanent ledger."""
+        layered = getattr(self, "layered_runtime", None)
+        if layered is None or not layered.is_open:
+            return 0
+        records = self._legacy_seen_video_records()
+        created = await layered.seen_videos.import_many(records)
+        total = await layered.seen_videos.count()
+        logger.info(
+            f"[BiliBot] 永久视频去重账本已就绪: {total} 条"
+            f"（本次迁移新增 {created} 条）"
+        )
+        return total
+
+    async def _seen_video_bvids(self):
+        """Return permanent seen BVs, with legacy sources as a safe fallback."""
+        result = {
+            str(item.get("bvid") or "")
+            for item in self._legacy_seen_video_records()
+            if item.get("bvid")
+        }
+        layered = getattr(self, "layered_runtime", None)
+        if layered is not None and layered.is_open:
+            try:
+                result.update(await layered.seen_videos.all_bvids())
+            except Exception as exc:
+                logger.warning(f"[BiliBot] 读取永久视频去重账本失败，使用兼容记录: {exc}")
+        return result
+
+    async def _has_seen_video(self, bvid):
+        key = str(bvid or "").strip()
+        if not key:
+            return False
+        return ("BV" + key[2:] if key[:2].lower() == "bv" else key) in (
+            await self._seen_video_bvids()
+        )
+
+    async def _seen_video_record(self, bvid):
+        """Return the lightweight trace without pulling video content into the ledger."""
+        key = str(bvid or "").strip()
+        if len(key) < 4 or key[:2].lower() != "bv":
+            return None
+        key = "BV" + key[2:]
+        ledger = self._load_json(SEEN_VIDEOS_FILE, {})
+        if isinstance(ledger, dict) and isinstance(ledger.get(key), dict):
+            return dict(ledger[key])
+        layered = getattr(self, "layered_runtime", None)
+        if layered is not None and layered.is_open:
+            try:
+                return await layered.seen_videos.get(key)
+            except Exception as exc:
+                logger.warning(f"[BiliBot] 读取视频观看痕迹失败: {exc}")
+        return None
+
+    async def _mark_video_seen(
+        self, bvid, info=None, source="watch", *, increment=True
+    ):
+        """Persist a watched BV before capped activity logs can forget it."""
+        data = info if isinstance(info, dict) else {}
+        key = str(bvid or data.get("bvid") or "").strip()
+        if len(key) < 4 or key[:2].lower() != "bv":
+            return False
+        key = "BV" + key[2:]
+        lock = getattr(self, "_seen_video_write_lock", None)
+        if lock is None:
+            import asyncio
+            lock = self._seen_video_write_lock = asyncio.Lock()
+        async with lock:
+            ledger = self._load_json(SEEN_VIDEOS_FILE, {})
+            if not isinstance(ledger, dict):
+                ledger = {}
+            previous = ledger.get(key) if isinstance(ledger.get(key), dict) else {}
+            now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
+            previous_count = int(previous.get("watch_count", 0) or 0)
+            ledger[key] = {
+                "bvid": key,
+                "first_seen_at": previous.get("first_seen_at") or now_text,
+                "last_related_at": now_text,
+                "watch_count": max(1, previous_count + (1 if increment else 0)),
+                "title": data.get("title") or previous.get("title", ""),
+                "owner_mid": str(
+                    data.get("owner_mid") or data.get("up_mid")
+                    or previous.get("owner_mid", "")
+                ),
+                "owner_name": data.get("owner_name")
+                or data.get("up_name")
+                or previous.get("owner_name", ""),
+                "tname": data.get("tname") or previous.get("tname", ""),
+                "source": source or previous.get("source", ""),
+            }
+            self._save_json(SEEN_VIDEOS_FILE, ledger)
+            layered = getattr(self, "layered_runtime", None)
+            if layered is not None and layered.is_open:
+                try:
+                    await layered.seen_videos.mark_seen(
+                        key,
+                        seen_at=datetime.now().timestamp(),
+                        title=ledger[key]["title"],
+                        owner_mid=ledger[key]["owner_mid"],
+                        owner_name=ledger[key]["owner_name"],
+                        tname=ledger[key]["tname"],
+                        source=source,
+                        increment=increment,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[BiliBot] 永久视频去重账本写入失败，已保留 JSON: {exc}"
+                    )
+        return True
+
     async def _save_memory_entry(self, record):
         lock = getattr(self, "_memory_write_lock", None)
         if lock is None:
@@ -224,6 +463,169 @@ class MemoryMixin:
             self._mark_memory_sync_pending(exc)
             logger.warning(f"[BiliBot] 统一记忆快照同步失败，已保留 JSON 待同步: {exc}")
         self._save_json(MEMORY_FILE, self._memory_backup_records(self._memory))
+
+    @staticmethod
+    def _is_derived_memory(record):
+        """Return whether a memory is a generated summary of other memories."""
+        rpid = str(record.get("rpid") or "")
+        text = str(record.get("text") or "")
+        return bool(
+            record.get("derived_from_rpids")
+            or record.get("summary_kind")
+            or rpid.startswith(("oid_compressed_", "thread_compressed_", "compressed_"))
+            or text.startswith(("[评论区总结]", "[评论线总结]", "[记忆压缩]"))
+        )
+
+    @staticmethod
+    def _derived_memory_id(prefix, records):
+        """Build a collision-free, reproducible ID from the source memory IDs."""
+        source_ids = sorted(
+            {str(item.get("rpid") or "") for item in records if item.get("rpid")}
+        )
+        digest = hashlib.sha256(
+            json.dumps(source_ids, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:24]
+        return f"{prefix}_{digest}"
+
+    @staticmethod
+    def _legacy_summary_depends_on(summary, target):
+        """Conservatively infer dependencies for summaries created before provenance existed."""
+        if not MemoryMixin._is_derived_memory(summary):
+            return False
+        if summary.get("derived_from_rpids"):
+            return False
+
+        summary_thread = str(summary.get("thread_id") or "")
+        target_thread = str(target.get("thread_id") or "")
+        if summary_thread and target_thread and summary_thread == target_thread:
+            return True
+
+        summary_oid = str(summary.get("oid") or "")
+        target_oid = str(target.get("oid") or "")
+        if summary_oid and target_oid and summary_oid == target_oid:
+            return True
+
+        # 用户压缩总结没有可靠的评论线/视频归属；旧数据只能按用户和 scope
+        # 保守失效，防止删除的原文仍从旧摘要中被召回。评论线/评论区摘要
+        # 不走此兜底，否则会误删同一用户在别处的独立摘要。
+        summary_rpid = str(summary.get("rpid") or "")
+        summary_text = str(summary.get("text") or "")
+        is_user_summary = bool(
+            summary.get("summary_kind") == "user"
+            or summary_rpid.startswith("compressed_")
+            or summary_text.startswith("[记忆压缩]")
+        )
+        if not is_user_summary:
+            return False
+        summary_uid = str(summary.get("user_id") or "")
+        target_uid = str(target.get("user_id") or "")
+        if summary_uid not in {"", "self", "summary"} and summary_uid == target_uid:
+            summary_scope = str(summary.get("scope") or "")
+            target_scope = str(target.get("scope") or "")
+            return bool(summary_scope and summary_scope == target_scope)
+        return False
+
+    def _remove_profile_memory_refs(self, removed_rpids):
+        """Prune lightweight live-memory references after their memories are deleted."""
+        removed = {str(item) for item in removed_rpids if item}
+        if not removed:
+            return 0
+        profiles = self._load_json(USER_PROFILE_FILE, {})
+        if not isinstance(profiles, dict):
+            return 0
+        changed = 0
+        for profile in profiles.values():
+            if not isinstance(profile, dict):
+                continue
+            live = profile.get("live")
+            if not isinstance(live, dict):
+                continue
+            refs = live.get("memory_refs")
+            if not isinstance(refs, list):
+                continue
+            kept = [ref for ref in refs if str(ref) not in removed]
+            changed += len(refs) - len(kept)
+            if len(kept) != len(refs):
+                live["memory_refs"] = kept
+        if changed:
+            self._save_json(USER_PROFILE_FILE, profiles)
+        return changed
+
+    async def _delete_memory_by_rpid(self, rpid):
+        """Precisely delete one memory and invalidate summaries derived from it.
+
+        This is the storage primitive for future Web management. It deliberately
+        does not delete independent user-profile facts; clearing a profile has a
+        different meaning and will use a separate operation.
+        """
+        key = str(rpid or "").strip()
+        report = {
+            "requested_rpid": key,
+            "found": False,
+            "deleted_count": 0,
+            "invalidated_summary_count": 0,
+            "profile_memory_refs_removed": 0,
+            "removed_rpids": [],
+        }
+        if not key:
+            return report
+
+        lock = getattr(self, "_memory_write_lock", None)
+        if lock is None:
+            import asyncio
+            lock = self._memory_write_lock = asyncio.Lock()
+        async with lock:
+            by_id = {
+                str(item.get("rpid") or ""): item
+                for item in self._memory
+                if isinstance(item, dict) and item.get("rpid")
+            }
+            target = by_id.get(key)
+            if target is None:
+                return report
+
+            removed = {key}
+            targets = [target]
+            changed = True
+            while changed:
+                changed = False
+                for candidate_id, candidate in by_id.items():
+                    if candidate_id in removed or not self._is_derived_memory(candidate):
+                        continue
+                    raw_sources = candidate.get("derived_from_rpids", [])
+                    sources = {
+                        str(item)
+                        for item in raw_sources
+                        if item
+                    } if isinstance(raw_sources, (list, tuple, set)) else set()
+                    depends = bool(sources & removed)
+                    if not depends:
+                        depends = any(
+                            self._legacy_summary_depends_on(candidate, item)
+                            for item in targets
+                        )
+                    if depends:
+                        removed.add(candidate_id)
+                        targets.append(candidate)
+                        changed = True
+
+            self._memory = [
+                item for item in self._memory
+                if str(item.get("rpid") or "") not in removed
+            ]
+            await self._replace_memory_snapshot(assume_locked=True)
+            profile_refs_removed = self._remove_profile_memory_refs(removed)
+
+        report.update(
+            {
+                "found": True,
+                "deleted_count": len(removed),
+                "invalidated_summary_count": max(0, len(removed) - 1),
+                "profile_memory_refs_removed": profile_refs_removed,
+                "removed_rpids": sorted(removed),
+            }
+        )
+        return report
 
     @staticmethod
     def _memory_type_label(memory_type):
@@ -415,7 +817,14 @@ class MemoryMixin:
         qe = await self._get_embedding(query_text)
         if not qe:
             return []
-        scored = [(self._cosine_similarity(qe, m["embedding"]), m["text"]) for m in um]
+        scored = [
+            (
+                self._cosine_similarity(qe, m["embedding"])
+                * self._memory_recall_weight(m),
+                m["text"],
+            )
+            for m in um
+        ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [t for s, t in scored[:MAX_SEMANTIC_RESULTS] if s > 0.6]
 
@@ -437,7 +846,14 @@ class MemoryMixin:
         qe = await self._get_embedding(query_text)
         if not qe:
             return []
-        scored = [(self._cosine_similarity(qe, m["embedding"]), m) for m in cands]
+        scored = [
+            (
+                self._cosine_similarity(qe, m["embedding"])
+                * self._memory_recall_weight(m),
+                m,
+            )
+            for m in cands
+        ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [(s, m) for s, m in scored[:limit] if s > score_threshold]
 
@@ -484,7 +900,7 @@ class MemoryMixin:
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
             emb = await self._get_embedding(summary)
             comp = {
-                "rpid": f"oid_compressed_{int(datetime.now().timestamp())}",
+                "rpid": self._derived_memory_id("oid_compressed", old),
                 "thread_id": f"oid_summary:{oid_str}",
                 "oid": oid_str,
                 "user_id": "summary",
@@ -492,6 +908,8 @@ class MemoryMixin:
                 "text": f"[评论区总结] {summary}",
                 "source": "bilibili",
                 "memory_type": "user_summary",
+                "summary_kind": "oid",
+                "derived_from_rpids": sorted({str(m["rpid"]) for m in old}),
                 "level": "long_term", "importance": 7, "promoted_at": now,
             }
             # 保留视频元数据（从被压缩的记录中提取）
@@ -540,13 +958,15 @@ class MemoryMixin:
             # 保留oid字段
             old_oid = old[0].get("oid", "")
             comp = {
-                "rpid": f"thread_compressed_{int(datetime.now().timestamp())}",
+                "rpid": self._derived_memory_id("thread_compressed", old),
                 "thread_id": str(thread_id),
                 "user_id": old[0].get("user_id", ""),
                 "time": now,
                 "text": f"[评论线总结] {summary}",
                 "source": "bilibili",
                 "memory_type": "chat",
+                "summary_kind": "thread",
+                "derived_from_rpids": sorted({str(m["rpid"]) for m in old}),
                 "level": "long_term", "importance": 6, "promoted_at": now,
             }
             if old_oid:
@@ -619,11 +1039,13 @@ class MemoryMixin:
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
             emb = await self._get_embedding(result.get("summary", ""))
             comp = {
-                "rpid": f"compressed_{int(datetime.now().timestamp())}",
+                "rpid": self._derived_memory_id("compressed", old),
                 "thread_id": f"compressed:{memory_scope}", "user_id": str(user_id),
                 "time": now, "text": f"[记忆压缩] {result.get('summary', '')}",
                 "source": "bilibili", "memory_type": "user_summary",
                 "scope": str(memory_scope),
+                "summary_kind": "user",
+                "derived_from_rpids": sorted({str(m["rpid"]) for m in old}),
                 "level": "long_term", "importance": 7, "promoted_at": now,
             }
             # 保留元数据（用户可能在多个视频下互动，取最近的）
@@ -771,7 +1193,14 @@ class MemoryMixin:
         qe = await self._get_embedding(query_text)
         if not qe:
             return []
-        scored = [(self._cosine_similarity(qe, m["embedding"]), m) for m in cands]
+        scored = [
+            (
+                self._cosine_similarity(qe, m["embedding"])
+                * self._memory_recall_weight(m),
+                m,
+            )
+            for m in cands
+        ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         # 取 top N，但最低要有基本的语义相关（0.5 以下基本是噪声）
         results = []

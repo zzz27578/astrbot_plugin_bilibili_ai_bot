@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import tempfile
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -214,6 +215,49 @@ class LayeredRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(snapshot["tables"]["events"], 1)
         self.assertIn("energy", snapshot["persona"])
 
+    async def test_preference_lifecycle_is_idempotent_and_supports_decay(self):
+        at = datetime(2026, 8, 20, 12, tzinfo=timezone.utc).timestamp()
+
+        async def add(source, signal_type, value, polarity, strength, days_ago):
+            return await self.layers.preferences.record_video_signals(
+                source_ref=source,
+                occurred_at=at - days_ago * 86400,
+                signals=[{
+                    "type": signal_type,
+                    "value": value,
+                    "polarity": polarity,
+                    "strength": strength,
+                    "evidence": "测试证据",
+                }],
+            )
+
+        self.assertEqual(await add("BV-candidate", "theme", "灯塔", "curious", 0.7, 0), 1)
+        self.assertEqual(await add("BV-candidate", "theme", "灯塔", "curious", 0.7, 0), 0)
+        await add("BV-up-1", "up", "泛式", "like", 0.9, 1)
+        await add("BV-up-2", "up", "泛式", "like", 0.8, 3)
+        await add("BV-eva-1", "work", "EVA", "like", 0.8, 16)
+        await add("BV-eva-2", "work", "EVA", "like", 0.9, 9)
+        await add("BV-eva-3", "work", "EVA", "like", 1.0, 2)
+        await add("BV-food-1", "food", "白酒测评", "fatigue", 0.8, 1)
+        await add("BV-food-2", "food", "白酒测评", "fatigue", 0.9, 2)
+
+        refreshed = await self.layers.preferences.refresh(at=at)
+        by_value = {item["value"]: item for item in refreshed["current"]}
+        self.assertEqual(by_value["灯塔"]["stage"], "candidate")
+        self.assertEqual(by_value["泛式"]["stage"], "recent")
+        self.assertEqual(by_value["EVA"]["stage"], "stable")
+        self.assertEqual(by_value["白酒测评"]["polarity"], "fatigue")
+
+        decayed = await self.layers.preferences.refresh(at=at + 10 * 86400)
+        decayed_by_value = {item["value"]: item for item in decayed["current"]}
+        self.assertNotIn("灯塔", decayed_by_value)
+        self.assertEqual(decayed_by_value["泛式"]["lifecycle_action"], "weakened")
+        self.assertEqual(decayed_by_value["EVA"]["stage"], "stable")
+
+        expired = await self.layers.preferences.refresh(at=at + 110 * 86400)
+        self.assertEqual(expired["current"], [])
+        self.assertTrue(any(item["lifecycle_action"] == "deleted" for item in expired["changes"]))
+
     async def test_legacy_memory_roundtrip_separates_vector_and_metadata(self):
         record = {
             "rpid": "reply-100",
@@ -351,6 +395,90 @@ class LayeredRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(running["state"], "unknown")
         self.assertEqual(running["detail"], "restart_during_send")
         self.assertEqual(counter, 0)
+
+    async def test_seen_video_ledger_is_uncapped_and_survives_restart(self):
+        for index in range(260):
+            await self.layers.seen_videos.mark_seen(
+                f"BV{index:010d}", title=f"视频{index}", source="test"
+            )
+        self.assertEqual(await self.layers.seen_videos.count(), 260)
+        self.assertTrue(await self.layers.seen_videos.contains("bv0000000000"))
+
+        database_path = Path(self.temp_dir.name) / "bilibot.sqlite3"
+        await self.layers.close()
+        self.layers = LayeredRuntime({}, database_path)
+        await self.layers.open()
+
+        self.assertEqual(await self.layers.seen_videos.count(), 260)
+        first = await self.layers.seen_videos.get("BV0000000000")
+        self.assertEqual(first["title"], "视频0")
+
+    async def test_seen_video_legacy_import_is_idempotent(self):
+        record = {
+            "bvid": "BV1TEST00000",
+            "first_seen_at": 100.0,
+            "last_related_at": 200.0,
+            "title": "旧视频",
+            "source": "legacy",
+        }
+        self.assertEqual(await self.layers.seen_videos.import_many([record]), 1)
+        self.assertEqual(await self.layers.seen_videos.import_many([record]), 0)
+        row = await self.layers.seen_videos.get(record["bvid"])
+        self.assertEqual(row["watch_count"], 1)
+        self.assertEqual(row["first_seen_at"], 100.0)
+        self.assertEqual(row["last_related_at"], 200.0)
+
+    async def test_feedback_candidates_are_idempotent_and_relation_weighted(self):
+        owner = await self.layers.feedback.record_candidate(
+            event_key="bili_comment:owner-1", actor_id="42", actor_name="主人",
+            scope="bili_comment", feedback_type="suggestion", topic="回复太机械",
+            event_summary="主人建议说话自然一点",
+            possible_mistake="回复像客服模板", next_time="先回应具体内容",
+            confidence=0.95, relation_weight=3.0, is_owner=True,
+        )
+        duplicate = await self.layers.feedback.record_candidate(
+            event_key="bili_comment:owner-1", actor_id="42", actor_name="主人",
+            scope="bili_comment", feedback_type="suggestion", topic="回复太机械",
+            relation_weight=3.0, is_owner=True,
+        )
+        await self.layers.feedback.record_candidate(
+            event_key="bili_comment:user-1", actor_id="99", actor_name="群友",
+            scope="bili_comment", feedback_type="suggestion", topic="回复太机械",
+            next_time="少用服务式反问", confidence=0.8, relation_weight=1.0,
+        )
+
+        self.assertTrue(owner)
+        self.assertFalse(duplicate)
+        aggregate = await self.layers.feedback.aggregate(days=7)
+        self.assertEqual(aggregate[0]["count"], 2)
+        self.assertEqual(aggregate[0]["distinct_actors"], 2)
+        self.assertEqual(aggregate[0]["owner_count"], 1)
+        self.assertEqual(aggregate[0]["weighted_score"], 4.0)
+
+    async def test_feedback_recall_requires_support_and_scene_relevance(self):
+        await self.layers.feedback.record_candidate(
+            event_key="comment:owner-mechanical", actor_id="42", actor_name="主人",
+            scope="bili_comment", feedback_type="correction", topic="机械回复",
+            next_time="先回应评论里的具体内容", relation_weight=3.0,
+            is_owner=True,
+        )
+        await self.layers.feedback.record_candidate(
+            event_key="comment:single-service", actor_id="99", actor_name="普通用户",
+            scope="bili_comment", feedback_type="suggestion", topic="客服腔",
+            next_time="少用服务式结尾", relation_weight=1.0,
+        )
+        await self.layers.feedback.record_candidate(
+            event_key="comment:owner-download", actor_id="42", actor_name="主人",
+            scope="bili_comment", feedback_type="correction", topic="视频下载失败",
+            next_time="更换下载格式", relation_weight=3.0, is_owner=True,
+        )
+
+        relevant = await self.layers.feedback.relevant(
+            "你这次回复太机械了，也有客服腔", days=30
+        )
+
+        self.assertEqual([item["topic"] for item in relevant], ["机械回复"])
+        self.assertGreater(relevant[0]["relevance_score"], 0)
 
     def test_stored_action_digest_uses_security_hash(self):
         key = StoredActionRequest(tool="post_dynamic", args={"text": "hi"}).digest_key()

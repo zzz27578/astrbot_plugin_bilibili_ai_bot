@@ -1,4 +1,5 @@
 """定时任务调度：主动视频和动态发布的时间管理。"""
+import asyncio
 import hashlib
 import json
 import random
@@ -14,6 +15,10 @@ from .config import (
 class ScheduleMixin:
     """日程管理。"""
 
+    _SCHEDULE_TRIGGER_GRACE_MINUTES = 5
+    _PLAN_GENERATION_WINDOW_MINUTES = 15
+    _PLAN_RETRY_GRACE_MINUTES = 5
+
     _AUTONOMOUS_LIMITS = {
         "reply": ("AUTONOMOUS_REPLY_DAILY_MIN", "AUTONOMOUS_REPLY_DAILY_MAX", "AUTONOMOUS_REPLY_DAILY_LIMIT", 80),
         "private": ("AUTONOMOUS_PRIVATE_DAILY_MIN", "AUTONOMOUS_PRIVATE_DAILY_MAX", "AUTONOMOUS_PRIVATE_DAILY_LIMIT", 30),
@@ -22,32 +27,29 @@ class ScheduleMixin:
     }
 
     def _autonomous_limit_range(self, kind):
-        """Return the configured (minimum, maximum) for an autonomous quota.
+        """Return ``(0, hard maximum)`` for an autonomous safety budget.
 
         The old ``*_DAILY_LIMIT`` keys remain readable for existing installs.
         If a user has customized an old key and the new max key is still at its
-        schema default, the old value is treated as the migrated maximum.
+        schema default, the old value is treated as the migrated maximum.  Old
+        lower-bound keys are deliberately ignored: no behaviour is performed to
+        fill a quota.
         """
         min_key, max_key, legacy_key, default_max = self._AUTONOMOUS_LIMITS[kind]
-        minimum = self.config.get(min_key, 0)
         maximum = self.config.get(max_key, None)
         legacy = self.config.get(legacy_key, default_max)
         try:
-            minimum = max(0, int(minimum or 0))
-        except (TypeError, ValueError):
-            minimum = 0
-        try:
-            maximum = int(maximum) if maximum is not None else int(legacy or default_max)
-        except (TypeError, ValueError):
-            maximum = int(legacy or default_max)
-        try:
-            legacy = int(legacy or default_max)
+            legacy = int(legacy) if legacy is not None else int(default_max)
         except (TypeError, ValueError):
             legacy = int(default_max)
+        try:
+            maximum = int(maximum) if maximum is not None else legacy
+        except (TypeError, ValueError):
+            maximum = legacy
         if maximum == int(default_max) and legacy != int(default_max):
             maximum = legacy
-        maximum = max(minimum, maximum, 0)
-        return minimum, maximum
+        maximum = max(maximum, 0)
+        return 0, maximum
 
     def _autonomous_limit_max(self, kind):
         return self._autonomous_limit_range(kind)[1]
@@ -141,7 +143,15 @@ class ScheduleMixin:
             due_minute = parsed[0] * 60 + parsed[1]
         else:
             due_minute = (int(self.config.get("SLEEP_END", 8)) * 60 + max(0, int(self.config.get("AUTONOMOUS_PLAN_AFTER_SLEEP_MINUTES", 5)))) % 1440
-        return now.hour * 60 + now.minute >= due_minute
+        elapsed = now.hour * 60 + now.minute - due_minute
+        return 0 <= elapsed <= self._PLAN_GENERATION_WINDOW_MINUTES
+
+    @classmethod
+    def _schedule_slot_due(cls, now, hour, minute):
+        """Only trigger near the configured slot; never replay stale events."""
+        scheduled = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+        elapsed = (now - scheduled).total_seconds()
+        return 0 <= elapsed < cls._SCHEDULE_TRIGGER_GRACE_MINUTES * 60
 
     def _autonomous_config_fingerprint(self):
         keys = (
@@ -273,6 +283,24 @@ class ScheduleMixin:
                 return {}
 
     async def _ensure_autonomous_daily_plan(self, force=False):
+        """Serialize plan generation so WebUI and the main loop cannot duplicate it."""
+        lock = getattr(self, "_autonomous_plan_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._autonomous_plan_lock = lock
+        waited_for_inflight = lock.locked()
+        async with lock:
+            if waited_for_inflight:
+                cached = self._load_json(AUTONOMOUS_PLAN_FILE, {})
+                if (
+                    isinstance(cached, dict)
+                    and cached.get("date") == datetime.now().strftime("%Y-%m-%d")
+                    and cached.get("config_fingerprint") == self._autonomous_config_fingerprint()
+                ):
+                    return cached
+            return await self._ensure_autonomous_daily_plan_locked(force=force)
+
+    async def _ensure_autonomous_daily_plan_locked(self, force=False):
         """Generate one validated LLM plan per day and clamp it to admin limits."""
         if not self.config.get("ENABLE_AUTONOMOUS_DAILY_PLAN", False):
             return {}
@@ -282,24 +310,44 @@ class ScheduleMixin:
         cached_matches = isinstance(cached, dict) and cached.get("date") == today and cached.get("config_fingerprint") == fingerprint
         if not force and cached_matches and cached.get("generation_status") != "error":
             return cached
-        if not force and not self._autonomous_generation_due():
-            return cached if cached_matches else {}
+        previous_attempts = 0
+        retrying = False
         if not force and cached_matches and cached.get("generation_status") == "error":
+            previous_attempts = max(1, int(cached.get("model_attempts", 1) or 1))
+            if previous_attempts >= 2 or cached.get("retry_exhausted"):
+                return cached
             retry_minutes = max(5, int(self.config.get("AUTONOMOUS_PLAN_RETRY_MINUTES", 15)))
             try:
                 generated_at = datetime.strptime(str(cached.get("generated_at")), "%Y-%m-%d %H:%M:%S")
-                if datetime.now() - generated_at < timedelta(minutes=retry_minutes):
+                retry_at = generated_at + timedelta(minutes=retry_minutes)
+                retry_deadline = retry_at + timedelta(minutes=self._PLAN_RETRY_GRACE_MINUTES)
+                now = datetime.now()
+                if now < retry_at:
                     return cached
+                if now > retry_deadline:
+                    cached["retry_exhausted"] = True
+                    cached["model_error"] = (
+                        f"{str(cached.get('model_error') or '模型计划生成失败')}；"
+                        "已错过唯一一次重试窗口，今天不再自动请求"
+                    )[:240]
+                    self._save_json(AUTONOMOUS_PLAN_FILE, cached)
+                    return cached
+                retrying = True
             except (TypeError, ValueError):
-                pass
+                cached["retry_exhausted"] = True
+                self._save_json(AUTONOMOUS_PLAN_FILE, cached)
+                return cached
+        elif not force and not self._autonomous_generation_due():
+            return cached if cached_matches else {}
 
         activity = max(0, min(100, int(self.config.get("AUTONOMOUS_ACTIVITY_LEVEL", 55))))
         proactive_min, proactive_cap = self._autonomous_limit_range("proactive")
         dynamic_min, dynamic_cap = self._autonomous_limit_range("dynamic")
-        # 0 means no additional video-count cap. The autonomous action-range
-        # maximum remains the safety ceiling for the number of browsing windows.
-        configured_video_limit = max(0, int(self.config.get("PROACTIVE_DAILY_LIMIT", 0) or 0))
-        proactive_max = min(configured_video_limit, proactive_cap) if configured_video_limit else proactive_cap
+        # Browsing windows and watched-video counts are deliberately separate:
+        # PROACTIVE_TIMES_COUNT limits rounds, while PROACTIVE_DAILY_LIMIT is
+        # enforced inside the watcher as the all-day video ceiling.
+        configured_round_limit = max(0, int(self.config.get("PROACTIVE_TIMES_COUNT", 2) or 0))
+        proactive_max = min(configured_round_limit, proactive_cap)
         proactive_max = max(0, proactive_max) if self._schedule_feature_enabled("proactive") else 0
         dynamic_max = max(0, min(
             int(self.config.get("DYNAMIC_TIMES_COUNT", self.config.get("DYNAMIC_DAILY_COUNT", 1))),
@@ -318,7 +366,7 @@ class ScheduleMixin:
 当前心情：{mood}
 活跃度：{activity}/100（低时应明显减少事件，高时也不能刷屏）
 睡眠区间：{int(self.config.get('SLEEP_START', 2)):02d}:00 到 {int(self.config.get('SLEEP_END', 8)):02d}:00
-管理员范围：主动浏览 {proactive_min}-{proactive_max} 个时间段，发布动态 {dynamic_min}-{dynamic_max} 次；关注动态巡视最多 {dynamic_watch_max} 次，追番最多 {bangumi_max} 次，特别关注最多 {follow_max} 次。下限只在对应能力已启用且当天条件允许时尽量满足。
+管理员安全上限：主动浏览最多 {proactive_max} 个时间段，发布动态最多 {dynamic_max} 次；关注动态巡视最多 {dynamic_watch_max} 次，追番最多 {bangumi_max} 次，特别关注最多 {follow_max} 次。所有数量都是上限，不是KPI；没有真实动机时可以填空数组，不要为了凑数安排事件。
 相邻主动事件至少间隔 {max(15, int(self.config.get('AUTONOMOUS_MIN_ACTION_GAP_MINUTES', 45)))} 分钟。
 人设摘要：{str(persona)[:1200]}
 管理员补充：{str(self.config.get('AUTONOMOUS_PLAN_PROMPT', ''))[:800]}
@@ -329,16 +377,22 @@ JSON 格式：{{"proactive_windows":["HH:MM-HH:MM"],"dynamic_times":["HH:MM"],"d
         try:
             raw_plan = await self._llm_call(prompt, max_tokens=600)
             model_plan = self._extract_plan_json(raw_plan)
-            if not raw_plan or not model_plan:
+            if not raw_plan:
                 generation_status = "error"
-                model_error = "模型调用失败、未配置模型提供商，或模型未返回有效计划"
+                model_error = str(
+                    getattr(self, "_last_llm_error", "")
+                    or "模型没有返回计划内容"
+                )[:240]
+            elif not model_plan:
+                generation_status = "error"
+                model_error = "模型已返回内容，但没有按要求生成有效的 JSON 日程"
         except Exception as exc:
             generation_status = "error"
             model_error = f"模型调用失败：{exc}"[:240]
-            logger.warning(f"[BiliBot] 自主日程生成失败，使用安全回退：{exc}")
+            logger.warning(f"[BiliBot] 自主日程生成失败，今天不新增自动事件：{exc}")
 
-        # Model may choose fewer actions. If it returns no usable count, use an
-        # activity-scaled deterministic fallback rather than always filling max.
+        # Activity only narrows the safety ceiling. It never creates a minimum
+        # quota, and a failed model call produces no new autonomous events.
         factor = 0.15 + 0.85 * activity / 100
 
         def activity_cap(minimum, maximum):
@@ -358,16 +412,20 @@ JSON 格式：{{"proactive_windows":["HH:MM-HH:MM"],"dynamic_times":["HH:MM"],"d
         }
 
         def target_for(key, minimum, maximum):
-            values = model_plan.get(key, [])
+            # The model protocol names proactive output ``proactive_windows``;
+            # the normalized plan keeps the legacy ``proactive_times`` field as
+            # well.  Count the field that the prompt actually asks the model to
+            # return, otherwise a valid window plan is silently reduced to zero.
+            source_key = "proactive_windows" if key == "proactive_times" else key
+            values = model_plan.get(source_key, [])
             soft_maximum = min(maximum, caps.get(key, maximum))
             if isinstance(values, list):
-                # The model may request fewer events, but it cannot bypass an
-                # administrator-configured lower bound when the feature is on.
-                requested = max(minimum, len(values))
+                requested = len(values)
                 return min(soft_maximum, requested)
             return soft_maximum
         if not model_plan:
-            targets = dict(caps)
+            # 模型失败时不替它编造主动意图；当天安全地保持无新增计划。
+            targets = {key: 0 for key in caps}
         else:
             targets = {key: target_for(key, minimum, maximum) for key, minimum, maximum in (
                 ("proactive_times", proactive_min, proactive_max), ("dynamic_times", dynamic_min, dynamic_max),
@@ -402,22 +460,32 @@ JSON 格式：{{"proactive_windows":["HH:MM-HH:MM"],"dynamic_times":["HH:MM"],"d
             normalized_times.append(self._minute_text(trigger))
         normalized["proactive_windows"] = proactive_windows
         normalized["proactive_times"] = normalized_times
-        reply_min, reply_max = self._autonomous_limit_range("reply")
-        private_min, private_max = self._autonomous_limit_range("private")
+        _reply_min, reply_max = self._autonomous_limit_range("reply")
+        _private_min, private_max = self._autonomous_limit_range("private")
         plan = {
             "date": today,
             "config_fingerprint": fingerprint,
             "activity_level": activity,
             "activity_label": "低迷" if activity < 25 else "平稳" if activity < 50 else "活跃" if activity < 75 else "高能",
             **normalized,
-            "reply_target": max(reply_min, min(reply_max, round(reply_min + (reply_max - reply_min) * factor))) if self.config.get("ENABLE_REPLY", True) else 0,
-            "private_target": max(private_min, min(private_max, round(private_min + (private_max - private_min) * factor))) if self.config.get("ENABLE_PRIVATE_MESSAGES", False) else 0,
-            "rationale": str(model_plan.get("rationale") or "根据今日活跃度生成，并受管理员范围与最小间隔保护。")[:240],
+            "reply_cap": reply_max if self.config.get("ENABLE_REPLY", True) else 0,
+            "private_cap": private_max if self.config.get("ENABLE_PRIVATE_MESSAGES", False) else 0,
+            "rationale": str(model_plan.get("rationale") or (
+                "根据今日活跃度生成，并受管理员安全上限与最小间隔保护。"
+                if generation_status == "success"
+                else "模型计划未生成，今天不新增自动事件。"
+            ))[:240],
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "generation_status": generation_status,
             "model_error": model_error,
-            "source": "model" if generation_status == "success" else "fallback",
+            "source": "model" if generation_status == "success" else "none",
+            "model_attempts": previous_attempts + 1,
+            "retry_exhausted": bool(generation_status == "error" and retrying),
         }
+        if generation_status == "error" and retrying:
+            plan["model_error"] = (
+                f"{model_error or '模型计划生成失败'}；唯一一次重试仍失败，今天不再自动请求"
+            )[:240]
         self._save_json(AUTONOMOUS_PLAN_FILE, plan)
         # Replace runtime schedule state immediately so WebUI regeneration and the
         # current main-loop iteration both see the new plan.
@@ -453,7 +521,9 @@ JSON 格式：{{"proactive_windows":["HH:MM-HH:MM"],"dynamic_times":["HH:MM"],"d
             self._proactive_windows = list(plan.get("proactive_windows", [])) if plan else []
             self._save_schedule_state(planned, set())
             return planned, set()
-        windows = self._fixed_window_entries()
+        configured_round_limit = max(0, int(self.config.get("PROACTIVE_TIMES_COUNT", 2) or 0))
+        round_cap = min(configured_round_limit, self._autonomous_limit_max("proactive"))
+        windows = self._fixed_window_entries()[:round_cap]
         self._proactive_windows = [{key: item[key] for key in ("start_time", "end_time", "scheduled_time")} | {"trigger_policy": "once_in_window"} for item in windows]
         times = [self._parse_time_value(item["scheduled_time"]) for item in windows]
         times = [item for item in times if item is not None]

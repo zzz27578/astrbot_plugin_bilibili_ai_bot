@@ -12,6 +12,10 @@ from .stores import (
     Profile,
     ProfileFact,
     ProfileStore,
+    FeedbackStore,
+    PreferenceStore,
+    SeenVideo,
+    SeenVideoStore,
 )
 
 __all__ = [
@@ -24,4 +28,8 @@ __all__ = [
     "Profile",
     "ProfileFact",
     "ProfileStore",
+    "FeedbackStore",
+    "PreferenceStore",
+    "SeenVideo",
+    "SeenVideoStore",
 ]

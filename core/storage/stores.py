@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 from array import array
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,6 +76,559 @@ class ProfileFact:
     approved: int
     created_at: float
     expires_at: float | None
+
+
+@dataclass
+class SeenVideo:
+    """永久轻量“看过”记录。"""
+
+    bvid: str
+    first_seen_at: float
+    last_related_at: float
+    watch_count: int
+    title: str
+    owner_mid: str
+    owner_name: str
+    tname: str
+    last_source: str
+
+
+class SeenVideoStore:
+    """永久 BV 去重账本；不按数量或时间裁剪。"""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @staticmethod
+    def normalize_bvid(value: Any) -> str:
+        raw = str(value or "").strip()
+        if len(raw) < 4 or raw[:2].lower() != "bv":
+            return ""
+        return "BV" + raw[2:]
+
+    @staticmethod
+    def _number(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError, OverflowError):
+            return float(default)
+
+    @staticmethod
+    def _mark_sync(conn, record: dict[str, Any]) -> bool:
+        bvid = SeenVideoStore.normalize_bvid(record.get("bvid"))
+        if not bvid:
+            return False
+        seen_at = SeenVideoStore._number(record.get("seen_at"), now())
+        first_seen_at = SeenVideoStore._number(
+            record.get("first_seen_at"), seen_at
+        )
+        last_related_at = SeenVideoStore._number(
+            record.get("last_related_at"), seen_at
+        )
+        first_seen_at, last_related_at = (
+            min(first_seen_at, last_related_at),
+            max(first_seen_at, last_related_at),
+        )
+        increment = 1 if bool(record.get("increment", True)) else 0
+        row = conn.execute(
+            "SELECT * FROM seen_videos WHERE bvid=?", (bvid,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO seen_videos(bvid,first_seen_at,last_related_at,"
+                "watch_count,title,owner_mid,owner_name,tname,last_source) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    bvid,
+                    first_seen_at,
+                    last_related_at,
+                    max(1, increment),
+                    str(record.get("title") or ""),
+                    str(record.get("owner_mid") or ""),
+                    str(record.get("owner_name") or ""),
+                    str(record.get("tname") or ""),
+                    str(record.get("source") or ""),
+                ),
+            )
+            return True
+        conn.execute(
+            "UPDATE seen_videos SET first_seen_at=?,last_related_at=?,watch_count=?,"
+            "title=?,owner_mid=?,owner_name=?,tname=?,last_source=? WHERE bvid=?",
+            (
+                min(float(row["first_seen_at"]), first_seen_at),
+                max(float(row["last_related_at"]), last_related_at),
+                int(row["watch_count"]) + increment,
+                str(record.get("title") or row["title"] or ""),
+                str(record.get("owner_mid") or row["owner_mid"] or ""),
+                str(record.get("owner_name") or row["owner_name"] or ""),
+                str(record.get("tname") or row["tname"] or ""),
+                str(record.get("source") or row["last_source"] or ""),
+                bvid,
+            ),
+        )
+        return False
+
+    async def mark_seen(
+        self,
+        bvid: str,
+        *,
+        seen_at: float | None = None,
+        title: str = "",
+        owner_mid: str = "",
+        owner_name: str = "",
+        tname: str = "",
+        source: str = "",
+        increment: bool = True,
+    ) -> bool:
+        record = {
+            "bvid": bvid,
+            "seen_at": seen_at if seen_at is not None else now(),
+            "title": title,
+            "owner_mid": owner_mid,
+            "owner_name": owner_name,
+            "tname": tname,
+            "source": source,
+            "increment": increment,
+        }
+        return bool(await self._db.run(self._mark_sync, record))
+
+    async def import_many(self, records: list[dict[str, Any]]) -> int:
+        """幂等迁移旧来源，不把多份旧副本误算成重复观看。"""
+        prepared = [dict(record, increment=False) for record in records]
+
+        def _import(conn):
+            created = 0
+            for record in prepared:
+                created += int(self._mark_sync(conn, record))
+            return created
+
+        return int(await self._db.run(_import))
+
+    async def contains(self, bvid: str) -> bool:
+        key = self.normalize_bvid(bvid)
+        if not key:
+            return False
+        return bool(
+            await self._db.fetch_value(
+                "SELECT 1 FROM seen_videos WHERE bvid=?", (key,), default=0
+            )
+        )
+
+    async def get(self, bvid: str) -> dict[str, Any] | None:
+        key = self.normalize_bvid(bvid)
+        if not key:
+            return None
+        row = await self._db.fetch_one(
+            "SELECT * FROM seen_videos WHERE bvid=?", (key,)
+        )
+        return dict(row) if row is not None else None
+
+    async def all_bvids(self) -> set[str]:
+        rows = await self._db.fetch_all("SELECT bvid FROM seen_videos")
+        return {str(row["bvid"]) for row in rows}
+
+    async def count(self) -> int:
+        return int(
+            await self._db.fetch_value(
+                "SELECT COUNT(*) FROM seen_videos", default=0
+            ) or 0
+        )
+
+
+class FeedbackStore:
+    """候选反馈仓库；不在这里直接改变人格或偏好。"""
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    async def record_candidate(
+        self,
+        *,
+        event_key: str,
+        actor_id: str,
+        actor_name: str,
+        scope: str,
+        feedback_type: str,
+        topic: str = "",
+        event_summary: str = "",
+        possible_mistake: str = "",
+        next_time: str = "",
+        confidence: float = 0.0,
+        relation_weight: float = 1.0,
+        is_owner: bool = False,
+        created_at: float | None = None,
+    ) -> bool:
+        timestamp = float(created_at if created_at is not None else now())
+        params = (
+                str(event_key)[:180], str(actor_id)[:80], str(actor_name)[:80],
+                str(scope)[:40], str(feedback_type)[:30], str(topic)[:80],
+                str(event_summary)[:160], str(possible_mistake)[:160],
+                str(next_time)[:160], max(0.0, min(1.0, float(confidence))),
+                max(0.1, min(5.0, float(relation_weight))),
+                1 if is_owner else 0, "candidate", timestamp,
+            )
+
+        def _insert(conn):
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO feedback_candidates("
+                "event_key,actor_id,actor_name,scope,feedback_type,topic,event_summary,"
+                "possible_mistake,next_time,confidence,relation_weight,is_owner,status,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                params,
+            )
+            return cursor.rowcount == 1
+
+        return bool(await self._db.run(_insert))
+
+    async def recent(self, *, days: int = 7) -> list[dict[str, Any]]:
+        since = now() - max(1, int(days)) * 86400
+        rows = await self._db.fetch_all(
+            "SELECT * FROM feedback_candidates WHERE created_at>=? "
+            "ORDER BY created_at DESC", (since,)
+        )
+        return [dict(row) for row in rows]
+
+    async def aggregate(self, *, days: int = 7) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in await self.recent(days=days):
+            key = (str(row["feedback_type"]), str(row["topic"] or "未分类反馈"))
+            item = grouped.setdefault(
+                key,
+                {
+                    "feedback_type": key[0], "topic": key[1], "count": 0,
+                    "weighted_score": 0.0, "actors": set(), "owner_count": 0,
+                    "examples": [],
+                },
+            )
+            item["count"] += 1
+            item["weighted_score"] += float(row["relation_weight"])
+            item["actors"].add(str(row["actor_id"]))
+            item["owner_count"] += int(row["is_owner"])
+            example = str(row["next_time"] or row["possible_mistake"] or "")
+            if example and example not in item["examples"] and len(item["examples"]) < 3:
+                item["examples"].append(example)
+        result = []
+        for item in grouped.values():
+            item["distinct_actors"] = len(item.pop("actors"))
+            item["weighted_score"] = round(item["weighted_score"], 2)
+            result.append(item)
+        return sorted(
+            result,
+            key=lambda item: (item["weighted_score"], item["distinct_actors"]),
+            reverse=True,
+        )
+
+    @staticmethod
+    def _relevance_terms(value: Any) -> set[str]:
+        """Extract conservative topic terms without exposing raw feedback."""
+        text = re.sub(r"\s+", " ", str(value or "").casefold()).strip()
+        terms = {
+            token for token in re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", text)
+        }
+        stop_terms = {
+            "这个", "那个", "一下", "有点", "感觉", "问题", "时候", "可以",
+            "还是", "回复", "用户", "内容", "应该", "不要", "需要",
+        }
+        for chunk in re.findall(r"[\u3400-\u9fff]+", text):
+            if len(chunk) >= 2:
+                terms.update(
+                    chunk[index:index + 2]
+                    for index in range(len(chunk) - 1)
+                    if chunk[index:index + 2] not in stop_terms
+                )
+        return terms
+
+    async def relevant(
+        self, query: str, *, days: int = 30, limit: int = 3
+    ) -> list[dict[str, Any]]:
+        """Return supported, scene-relevant reflection candidates only.
+
+        A single ordinary user's suggestion remains only a candidate: it is not
+        injected until the owner raised it, multiple actors agree, or accumulated
+        relationship weight is high enough. This is guidance, not personality
+        mutation.
+        """
+        query_terms = self._relevance_terms(query)
+        if not query_terms:
+            return []
+        ranked = []
+        for item in await self.aggregate(days=days):
+            if str(item.get("feedback_type") or "") not in {
+                "suggestion", "correction", "criticism",
+            }:
+                continue
+            if not (
+                int(item.get("owner_count", 0) or 0) >= 1
+                or int(item.get("distinct_actors", 0) or 0) >= 2
+                or float(item.get("weighted_score", 0) or 0) >= 2.5
+            ):
+                continue
+            candidate_text = " ".join([
+                str(item.get("topic") or ""),
+                *[str(value or "") for value in item.get("examples", [])],
+            ])
+            overlap = query_terms & self._relevance_terms(candidate_text)
+            if not overlap:
+                continue
+            ranked_item = dict(item)
+            ranked_item["relevance_score"] = round(
+                len(overlap) * 2.0
+                + min(5.0, float(item.get("weighted_score", 0) or 0))
+                + min(2.0, int(item.get("distinct_actors", 0) or 0) * 0.5),
+                2,
+            )
+            ranked.append(ranked_item)
+        ranked.sort(
+            key=lambda item: (
+                item["relevance_score"], item["owner_count"],
+                item["distinct_actors"], item["weighted_score"],
+            ),
+            reverse=True,
+        )
+        return ranked[:max(0, min(5, int(limit)))]
+
+
+class PreferenceStore:
+    """把视频评价信号沉淀为候选、近期和稳定偏好。"""
+
+    SIGNAL_TYPES = {
+        "up", "partition", "work", "character", "food", "theme", "music",
+        "game", "technology", "activity", "location", "other",
+    }
+    POLARITIES = {"like", "dislike", "fatigue", "curious"}
+    _POLARITY_WEIGHT = {
+        "like": 1.0,
+        "curious": 0.6,
+        "dislike": 1.0,
+        "fatigue": 0.85,
+    }
+    _STAGE_RANK = {"candidate": 1, "recent": 2, "stable": 3}
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+
+    @staticmethod
+    def _clean(value: Any, limit: int = 80) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+    @classmethod
+    def _key(cls, signal_type: str, value: str) -> str:
+        return f"{signal_type}:{value.casefold()}"
+
+    async def record_video_signals(
+        self,
+        *,
+        source_ref: str,
+        signals: list[dict[str, Any]],
+        occurred_at: float | None = None,
+    ) -> int:
+        """幂等写入一次观看产生的具体偏好证据。"""
+        timestamp = float(occurred_at if occurred_at is not None else now())
+        source = self._clean(source_ref, 160)
+        prepared = []
+        for signal in signals[:5] if isinstance(signals, list) else []:
+            if not isinstance(signal, dict):
+                continue
+            signal_type = self._clean(signal.get("type") or "other", 24)
+            value = self._clean(signal.get("value"), 80)
+            polarity = self._clean(signal.get("polarity"), 16)
+            if signal_type not in self.SIGNAL_TYPES or not value or polarity not in self.POLARITIES:
+                continue
+            try:
+                strength = max(0.0, min(1.0, float(signal.get("strength", 0))))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if strength <= 0:
+                continue
+            preference_key = self._key(signal_type, value)
+            digest_input = f"{source}|{timestamp:.3f}|{preference_key}|{polarity}"
+            evidence_key = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+            prepared.append((
+                evidence_key, preference_key, signal_type, value, polarity,
+                strength, source, timestamp,
+            ))
+        if not prepared:
+            return 0
+
+        def _insert(conn):
+            created = 0
+            for params in prepared:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO preference_evidence("
+                    "evidence_key,preference_key,signal_type,value,polarity,strength,"
+                    "source_ref,occurred_at) VALUES(?,?,?,?,?,?,?,?)",
+                    params,
+                )
+                created += int(cursor.rowcount == 1)
+            return created
+
+        return int(await self._db.run(_insert))
+
+    @staticmethod
+    def _week_starts(timestamps: list[float]) -> list:
+        starts = set()
+        for timestamp in timestamps:
+            day = datetime.fromtimestamp(timestamp, timezone.utc).date()
+            starts.add(day - timedelta(days=day.weekday()))
+        return sorted(starts)
+
+    @staticmethod
+    def _max_consecutive_weeks(starts: list) -> int:
+        best = run = 0
+        previous = None
+        for current in starts:
+            run = run + 1 if previous is not None and current - previous == timedelta(days=7) else 1
+            best = max(best, run)
+            previous = current
+        return best
+
+    async def refresh(self, *, at: float | None = None) -> dict[str, list[dict[str, Any]]]:
+        """重算生命周期；返回当前偏好和本轮变化，供周报使用。"""
+        timestamp = float(at if at is not None else now())
+        cutoff = timestamp - 180 * 86400
+
+        def _refresh(conn):
+            rows = conn.execute(
+                "SELECT * FROM preference_evidence WHERE occurred_at>=? "
+                "ORDER BY occurred_at", (cutoff,)
+            ).fetchall()
+            previous_rows = {
+                str(row["preference_key"]): dict(row)
+                for row in conn.execute("SELECT * FROM preferences").fetchall()
+            }
+            grouped: dict[str, list[Any]] = {}
+            for row in rows:
+                grouped.setdefault(str(row["preference_key"]), []).append(row)
+
+            current: list[dict[str, Any]] = []
+            changes: list[dict[str, Any]] = []
+            for preference_key in sorted(set(grouped) | set(previous_rows)):
+                evidence = grouped.get(preference_key, [])
+                old = previous_rows.get(preference_key)
+                if not evidence:
+                    if old:
+                        deleted = dict(old)
+                        deleted["lifecycle_action"] = "deleted"
+                        changes.append(deleted)
+                        conn.execute(
+                            "DELETE FROM preferences WHERE preference_key=?",
+                            (preference_key,),
+                        )
+                    continue
+
+                times = [float(row["occurred_at"]) for row in evidence]
+                first_seen, last_seen = min(times), max(times)
+                week_starts = self._week_starts(times)
+                consecutive = self._max_consecutive_weeks(week_starts)
+                recent_count = sum(value >= timestamp - 7 * 86400 for value in times)
+                age_days = max(0.0, (timestamp - last_seen) / 86400)
+                old_stage = str(old["stage"]) if old else ""
+
+                if age_days > 90:
+                    if old:
+                        deleted = dict(old)
+                        deleted["lifecycle_action"] = "deleted"
+                        changes.append(deleted)
+                    conn.execute(
+                        "DELETE FROM preferences WHERE preference_key=?",
+                        (preference_key,),
+                    )
+                    continue
+                if consecutive >= 3:
+                    stage = "stable"
+                elif recent_count >= 2:
+                    stage = "recent"
+                elif age_days <= 7:
+                    stage = "candidate"
+                elif old_stage == "stable" and age_days <= 90:
+                    stage = "stable"
+                elif old_stage == "recent" and age_days <= 21:
+                    stage = "recent"
+                else:
+                    if old:
+                        deleted = dict(old)
+                        deleted["lifecycle_action"] = "deleted"
+                        changes.append(deleted)
+                    conn.execute(
+                        "DELETE FROM preferences WHERE preference_key=?",
+                        (preference_key,),
+                    )
+                    continue
+
+                totals = {name: 0.0 for name in self.POLARITIES}
+                for row in evidence:
+                    totals[str(row["polarity"])] += float(row["strength"])
+                polarity = max(
+                    totals,
+                    key=lambda name: totals[name] * self._POLARITY_WEIGHT[name],
+                )
+                dominant = totals[polarity] * self._POLARITY_WEIGHT[polarity]
+                if stage == "stable":
+                    decay = max(0.1, 1.0 - age_days / 90.0)
+                    expires_at = last_seen + 90 * 86400
+                elif stage == "recent":
+                    decay = 1.0 if age_days <= 7 else max(0.1, 1.0 - (age_days - 7) / 14.0)
+                    expires_at = last_seen + 21 * 86400
+                else:
+                    decay = max(0.1, 1.0 - age_days / 7.0)
+                    expires_at = last_seen + 7 * 86400
+                score = round(min(1.0, dominant / max(1, len(evidence))) * decay, 3)
+
+                old_rank = self._STAGE_RANK.get(old_stage, 0)
+                new_rank = self._STAGE_RANK[stage]
+                old_count = int(old["evidence_count"]) if old else 0
+                if not old or new_rank > old_rank or len(evidence) > old_count:
+                    action = "enhanced"
+                elif age_days <= 7:
+                    action = "retained"
+                else:
+                    action = "weakened"
+
+                item = {
+                    "preference_key": preference_key,
+                    "signal_type": str(evidence[-1]["signal_type"]),
+                    "value": str(evidence[-1]["value"]),
+                    "polarity": polarity,
+                    "stage": stage,
+                    "score": score,
+                    "evidence_count": len(evidence),
+                    "active_weeks": len(week_starts),
+                    "first_seen": first_seen,
+                    "last_seen": last_seen,
+                    "lifecycle_action": action,
+                    "updated_at": timestamp,
+                    "expires_at": expires_at,
+                }
+                conn.execute(
+                    "INSERT INTO preferences(preference_key,signal_type,value,polarity,"
+                    "stage,score,evidence_count,active_weeks,first_seen,last_seen,"
+                    "lifecycle_action,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(preference_key) DO UPDATE SET signal_type=excluded.signal_type,"
+                    "value=excluded.value,polarity=excluded.polarity,stage=excluded.stage,"
+                    "score=excluded.score,evidence_count=excluded.evidence_count,"
+                    "active_weeks=excluded.active_weeks,first_seen=excluded.first_seen,"
+                    "last_seen=excluded.last_seen,lifecycle_action=excluded.lifecycle_action,"
+                    "updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                    tuple(item.values()),
+                )
+                current.append(item)
+                if action != "retained":
+                    changes.append(dict(item))
+            current.sort(
+                key=lambda item: (self._STAGE_RANK[item["stage"]], item["score"], item["last_seen"]),
+                reverse=True,
+            )
+            return {"current": current, "changes": changes}
+
+        return await self._db.run(_refresh)
+
+    async def current(self, *, limit: int = 30) -> list[dict[str, Any]]:
+        rows = await self._db.fetch_all(
+            "SELECT * FROM preferences ORDER BY "
+            "CASE stage WHEN 'stable' THEN 3 WHEN 'recent' THEN 2 ELSE 1 END DESC,"
+            "score DESC,last_seen DESC LIMIT ?", (max(1, int(limit)),)
+        )
+        return [dict(row) for row in rows]
 
 
 class MemoryStore:

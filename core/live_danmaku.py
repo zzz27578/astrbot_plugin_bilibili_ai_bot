@@ -382,11 +382,19 @@ class LiveDanmakuMixin:
                 0,
                 channel="live",
             )
-            if not result:
+            decision = str((result or {}).get("decision") or "error")
+            if decision in {"ignore", "observe"}:
+                await self.event_runtime.transition(
+                    f"bilibili:live:{event['event_id']}",
+                    EventState.IGNORED,
+                    f"model_{decision}",
+                )
+                return
+            if decision != "reply" or not result.get("reply"):
                 await self.event_runtime.transition(
                     f"bilibili:live:{event['event_id']}",
                     EventState.FAILED,
-                    "reply_generation_failed",
+                    str((result or {}).get("error") or "reply_generation_failed"),
                 )
                 return
             applied = await self._apply_live_reply_result(event, result)
@@ -423,6 +431,8 @@ class LiveDanmakuMixin:
         return len(self._live_reply_marks) >= max(1, min(30, limit))
 
     async def _apply_live_reply_result(self, event, result):
+        if not result.get("_protocol_validated") or result.get("decision") != "reply":
+            return False
         uid = event["uid"]
         username = event["username"]
         content = event["content"]
@@ -457,6 +467,13 @@ class LiveDanmakuMixin:
             self._save_json(AFFECTION_FILE, self._affection)
         else:
             new_score = old_score
+
+        commit_signals = getattr(self, "_commit_reply_signals", None)
+        if callable(commit_signals):
+            await commit_signals(
+                event_key=str(event["event_id"]), actor_id=uid,
+                actor_name=username, scope="bili_live", result=result,
+            )
 
         impression = str(result.get("impression", "") or "").strip()
         user_facts = result.get("user_facts", [])

@@ -514,7 +514,9 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
         logger.info(f"[BiliBot] 🔎 私信执行 up_info：{query} -> {selected_mid}")
         return "\n".join(lines)
 
-    async def _execute_private_model_tool(self, tool_request):
+    async def _execute_private_model_tool(
+        self, tool_request, *, actor_id="", original_content=""
+    ):
         """Execute the single read-only tool selected by the private-message reply model."""
         request = tool_request if isinstance(tool_request, dict) else {}
         name = str(request.get("name") or "none").strip().lower()
@@ -642,7 +644,6 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
             "search_bilibili": "video_search",
             "bili_search_and_watch": "search_and_watch",
             "watch_video": "watch_direct",
-            "bili_parse_video": "watch_direct",
         }
         if name in action_map:
             if not self.config.get("PRIVATE_MESSAGE_BILI_SEARCH_ENABLED", True):
@@ -665,10 +666,21 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
                 match = re.search(r"(?i)(BV[0-9A-Za-z]{10})", query)
                 if not match:
                     return "观看工具需要有效的 BV 号，未执行。"
-                result = await self._watch_video_and_save_memory(match.group(1), memory_source="private_tool")
+                force_rewatch = bool(
+                    self._is_owner(str(actor_id or ""))
+                    and re.search(
+                        r"(?:重新\s*看(?:一次|一遍|一下)?|重看)",
+                        str(original_content or ""),
+                    )
+                )
+                result = await self._watch_video_and_save_memory(
+                    match.group(1),
+                    memory_source="private_tool",
+                    force_rewatch=force_rewatch,
+                )
                 if result.get("ok"):
-                    return str(result.get("summary") or result.get("content") or "已完成视频读取。")
-                return str(result.get("error") or "视频读取失败，未生成回复依据。")
+                    return str(result.get("message") or "已完成视频读取。")
+                return str(result.get("message") or result.get("error") or "视频读取失败，未生成回复依据。")
             return await self._execute_private_bili_request(action, query)
 
         if name == "web_search":
@@ -980,6 +992,8 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
         self._save_json(block_file, block_log)
 
     async def _apply_private_reply_result(self, message, result, thread_id=None):
+        if not result.get("_protocol_validated") or result.get("decision") != "reply":
+            return False
         mid = str(message["sender_uid"])
         username = message["username"]
         content = message["content"]
@@ -1034,6 +1048,13 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
             self._record_relationship_interaction(mid, username, score_delta, "private")
             if milestone_hit:
                 self._commit_milestone(mid, milestone_hit[0], username)
+
+        commit_signals = getattr(self, "_commit_reply_signals", None)
+        if callable(commit_signals):
+            await commit_signals(
+                event_key=str(message["msg_key"]), actor_id=mid,
+                actor_name=username, scope="bili_dm", result=result,
+            )
 
         impression = result.get("impression", "")
         user_facts = result.get("user_facts", [])
@@ -1394,12 +1415,19 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
             reference_context=reference_context,
             allow_tool_request=allow_tool_request,
         )
-        if not result or not result.get("reply"):
-            logger.warning(f"[BiliBot] 私信回复生成失败，稍后重试：{username}({mid})")
+        decision = str((result or {}).get("decision") or "error")
+        if decision in {"ignore", "observe"}:
             await self.event_runtime.transition(
-                claim.event_key, EventState.FAILED, "reply_generation_failed"
+                claim.event_key, EventState.IGNORED, f"model_{decision}"
             )
-            return False
+            return True
+        if decision != "reply" or not result.get("reply"):
+            reason = str((result or {}).get("error") or "reply_generation_failed")
+            logger.warning(f"[BiliBot] 私信回复未生成：{username}({mid}) {reason}")
+            await self.event_runtime.transition(
+                claim.event_key, EventState.FAILED, reason
+            )
+            return reason == "invalid_model_output"
         tool_request = result.get("tool_request") or {}
         tool_name = str(tool_request.get("name") or "none").strip().lower()
         if tool_name != "none":
@@ -1422,7 +1450,9 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
             else:
                 logger.warning(f"[BiliBot] 私信工具查询前回复发送失败：{mid}")
 
-            reference_context = await self._execute_private_model_tool(tool_request)
+            reference_context = await self._execute_private_model_tool(
+                tool_request, actor_id=mid, original_content=content
+            )
             final_result = await self._generate_reply(
                 content,
                 mid,
@@ -1434,7 +1464,14 @@ query 只保留用于B站搜索的关键词或UP主名字，不要包含“帮�
                 reference_context=reference_context,
                 allow_tool_request=False,
             )
-            if not final_result or not final_result.get("reply"):
+            final_decision = str((final_result or {}).get("decision") or "error")
+            if final_decision in {"ignore", "observe"}:
+                await self.event_runtime.transition(
+                    claim.event_key, EventState.IGNORED,
+                    f"model_{final_decision}_after_tool",
+                )
+                return True
+            if final_decision != "reply" or not final_result.get("reply"):
                 logger.warning(
                     f"[BiliBot] 私信工具结果整合失败，已保留查询前回复：{username}({mid})"
                 )

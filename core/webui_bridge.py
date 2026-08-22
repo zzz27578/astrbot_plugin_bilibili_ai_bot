@@ -6,11 +6,13 @@ account credentials remain available only through the dedicated login routes.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import io
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -26,6 +28,7 @@ from .config import (
     DYNAMIC_LOG_FILE,
     DYNAMIC_SCHEDULE_FILE,
     DYNAMIC_WATCH_SCHEDULE_FILE,
+    PREFERENCE_STATE_FILE,
     PROACTIVE_LOG_FILE,
     REPLY_LOG_FILE,
     SCHEDULE_FILE,
@@ -70,13 +73,13 @@ AUTONOMOUS_MAX_COMPAT = {
     "AUTONOMOUS_DYNAMIC_DAILY_MAX": ("AUTONOMOUS_DYNAMIC_DAILY_LIMIT", 2),
     "AUTONOMOUS_PROACTIVE_DAILY_MAX": ("AUTONOMOUS_PROACTIVE_DAILY_LIMIT", 4),
 }
-AUTONOMOUS_RANGE_PAIRS = (
-    ("AUTONOMOUS_REPLY_DAILY_MIN", "AUTONOMOUS_REPLY_DAILY_MAX", "评论回复"),
-    ("AUTONOMOUS_PRIVATE_DAILY_MIN", "AUTONOMOUS_PRIVATE_DAILY_MAX", "私信回复"),
-    ("AUTONOMOUS_DYNAMIC_DAILY_MIN", "AUTONOMOUS_DYNAMIC_DAILY_MAX", "动态发布"),
-    ("AUTONOMOUS_PROACTIVE_DAILY_MIN", "AUTONOMOUS_PROACTIVE_DAILY_MAX", "主动行为"),
-)
+AUTONOMOUS_RANGE_PAIRS = ()  # 旧下限字段仅兼容读取，不再参与行为计划。
 Handler = Callable[[Any], Awaitable[Any]]
+
+WEB_INTEREST_CACHE_TTL_SECONDS = 30.0
+WEB_INTEREST_BREAKER_THRESHOLD = 3
+WEB_INTEREST_BREAKER_COOLDOWN_SECONDS = 60.0
+WEB_INTEREST_DB_TIMEOUT_SECONDS = 1.5
 
 
 def _response(data: Any = None, message: str | None = None):
@@ -101,9 +104,22 @@ def _bind(plugin: Any, handler: Handler):
 
 
 def register_webui(plugin_instance: Any, context: Context):
+    if getattr(plugin_instance, "_bilibot_extension_dispatcher", None) is None:
+        from .extensions import ExtensionDispatcher, ExtensionRegistry
+
+        async def reject_extension_write(**_kwargs: Any):
+            raise PermissionError(
+                "Bilibili upload and publish are not enabled by Extension API v1"
+            )
+
+        registry = ExtensionRegistry(context, plugin_instance, reject_extension_write)
+        plugin_instance._bilibot_extension_registry = registry
+        plugin_instance._bilibot_extension_dispatcher = ExtensionDispatcher(registry)
+
     routes: list[tuple[str, str, Handler, str]] = [
         ("stats", "GET", handle_get_stats, "BiliBot monitoring overview"),
         ("persona/state", "GET", handle_get_persona_state, "BiliBot persona state"),
+        ("interest/status", "GET", handle_get_interest_status, "BiliBot video interest status"),
         ("config/schema", "GET", handle_get_config_schema, "BiliBot configuration schema"),
         ("config", "GET", handle_get_config, "Read BiliBot configuration"),
         ("config", "POST", handle_save_config, "Save BiliBot configuration"),
@@ -122,6 +138,10 @@ def register_webui(plugin_instance: Any, context: Context):
         ("schedule/override", "POST", handle_schedule_override, "Save edited today's schedule"),
         ("security/stats", "GET", handle_security_stats, "BiliBot security statistics"),
         ("tools/available", "GET", handle_available_tools, "Available AstrBot tools for BiliBot"),
+        ("extensions", "GET", handle_extensions_list, "List isolated BiliBot extensions"),
+        ("extensions/page", "GET", handle_extension_page, "Render one extension page schema"),
+        ("extensions/action", "POST", handle_extension_action, "Dispatch one extension action"),
+        ("extensions/refresh", "POST", handle_extension_refresh, "Refresh extension discovery"),
     ]
     for endpoint, method, handler, description in routes:
         route = f"/{PLUGIN_NAME}/{endpoint}"
@@ -175,6 +195,105 @@ def _load_json(plugin: Any, path: str, default: Any) -> Any:
         return value if value is not None else default
     except Exception:
         return default
+
+
+def _safe_display_text(value: Any, *, max_chars: int = 12000) -> str:
+    """Limit control-panel text without interpreting user-influenced content."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    return text[:max(1, int(max_chars))]
+
+
+def _interest_file_preferences(plugin: Any) -> list[dict[str, Any]]:
+    snapshot = _load_json(plugin, PREFERENCE_STATE_FILE, {})
+    current = snapshot.get("current", []) if isinstance(snapshot, dict) else []
+    if not isinstance(current, list):
+        return []
+    return [dict(item) for item in current[:20] if isinstance(item, dict)]
+
+
+def _format_web_interest_payload(
+    plugin: Any,
+    lifecycle_items: list[dict[str, Any]],
+    *,
+    source: str,
+    stale: bool = False,
+) -> dict[str, Any]:
+    formatter = getattr(plugin, "_format_interest_report", None)
+    report = formatter(lifecycle_items=lifecycle_items) if callable(formatter) else "视频兴趣状态暂不可用"
+    return {
+        "report": _safe_display_text(report),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": source,
+        "cached": False,
+        "stale": bool(stale),
+        "read_only": True,
+    }
+
+
+async def _get_web_interest_payload(plugin: Any) -> dict[str, Any]:
+    """Read the interest report with a small cache and a gentle DB breaker.
+
+    This endpoint never invokes an LLM or an external API.  A broken/locked
+    SQLite runtime therefore cannot stall the control panel or cause request
+    amplification; the JSON lifecycle snapshot remains a read-only fallback.
+    """
+    now = time.monotonic()
+    cached = getattr(plugin, "_web_interest_cache", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        cached_at, cached_payload = cached
+        if now - float(cached_at or 0) < WEB_INTEREST_CACHE_TTL_SECONDS:
+            result = dict(cached_payload)
+            result["cached"] = True
+            return result
+
+    open_until = float(getattr(plugin, "_web_interest_circuit_open_until", 0.0) or 0.0)
+    if open_until > now:
+        last_good = getattr(plugin, "_web_interest_last_good", None)
+        if isinstance(last_good, dict):
+            result = dict(last_good)
+            result.update({"cached": True, "stale": True, "source": "stale_cache"})
+            return result
+        payload = _format_web_interest_payload(
+            plugin,
+            _interest_file_preferences(plugin),
+            source="circuit_fallback",
+            stale=True,
+        )
+        plugin._web_interest_cache = (now, payload)
+        return payload
+
+    lifecycle_items: list[dict[str, Any]] = []
+    source = "local_fallback"
+    layered = getattr(plugin, "layered_runtime", None)
+    store = getattr(layered, "preferences", None)
+    try:
+        if store is not None and getattr(layered, "is_open", False):
+            lifecycle_items = await asyncio.wait_for(
+                store.current(limit=20), timeout=WEB_INTEREST_DB_TIMEOUT_SECONDS
+            )
+            source = "runtime"
+        else:
+            lifecycle_items = _interest_file_preferences(plugin)
+        plugin._web_interest_failures = 0
+        plugin._web_interest_circuit_open_until = 0.0
+    except Exception as exc:
+        failures = int(getattr(plugin, "_web_interest_failures", 0) or 0) + 1
+        plugin._web_interest_failures = failures
+        lifecycle_items = _interest_file_preferences(plugin)
+        if failures >= WEB_INTEREST_BREAKER_THRESHOLD:
+            plugin._web_interest_circuit_open_until = now + WEB_INTEREST_BREAKER_COOLDOWN_SECONDS
+            logger.warning(
+                "[BiliBot WebUI] 兴趣状态数据库连续读取失败，暂停读取60秒并使用本地副本"
+            )
+        else:
+            logger.debug(f"[BiliBot WebUI] 兴趣状态读取失败，使用本地副本: {exc}")
+
+    payload = _format_web_interest_payload(plugin, lifecycle_items, source=source)
+    plugin._web_interest_cache = (now, payload)
+    if source == "runtime":
+        plugin._web_interest_last_good = dict(payload)
+    return payload
 
 
 def _today_entries(items: Any, *fields: str) -> list[dict[str, Any]]:
@@ -382,6 +501,22 @@ async def handle_get_persona_state(plugin: Any):
     except Exception as exc:
         logger.exception(f"[BiliBot WebUI] persona state failed: {exc}")
         return _failure(str(exc), 500)
+
+
+async def handle_get_interest_status(plugin: Any):
+    """Return a bounded, read-only view of the Bot's learned video interests."""
+    try:
+        return _response(await _get_web_interest_payload(plugin))
+    except Exception as exc:
+        logger.exception(f"[BiliBot WebUI] interest status failed: {exc}")
+        return _response({
+            "report": "视频兴趣状态暂时不可用，主动看片与回复功能不受影响。",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "safe_fallback",
+            "cached": False,
+            "stale": True,
+            "read_only": True,
+        })
 
 
 async def handle_memory_stats(plugin: Any):
@@ -601,7 +736,7 @@ async def handle_schedule_override(plugin: Any):
             plan.update({key: values for key, values in normalized.items() if key != "proactive_times"})
             plan["proactive_times"] = normalized["proactive_times"]
             plan["proactive_windows"] = windows
-            plan["source"] = plan.get("source") or "manual"
+            plan["source"] = "manual"
             plan["edited_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             plugin._save_json(AUTONOMOUS_PLAN_FILE, plan)
         else:
@@ -922,3 +1057,75 @@ async def handle_qr_poll(plugin: Any):
     except Exception as exc:
         logger.exception(f"[BiliBot WebUI] QR polling failed: {exc}")
         return _failure(f"登录状态获取失败：{exc}", 500)
+
+
+async def handle_extensions_list(plugin: Any):
+    """Discover extensions lazily; absence or failure never affects the base UI."""
+    try:
+        dispatcher = getattr(plugin, "_bilibot_extension_dispatcher", None)
+        if dispatcher is None:
+            return _response([])
+        return _response(await dispatcher.list_extensions())
+    except Exception as exc:
+        logger.warning(f"[BiliBot Extensions] list failed: {exc}")
+        return _response([])
+
+
+async def handle_extension_page(plugin: Any):
+    try:
+        extension_id = str(request.query.get("extension_id", "") or "").strip()
+        page_id = str(request.query.get("page_id", "dashboard") or "dashboard").strip()
+        if not extension_id:
+            return _failure("缺少 extension_id")
+        dispatcher = getattr(plugin, "_bilibot_extension_dispatcher", None)
+        if dispatcher is None:
+            return _failure("扩展 Host 尚未初始化", 503)
+        result = await dispatcher.dispatch(
+            extension_id,
+            f"page:{page_id}",
+            actor={"source": "bilibot-webui", "role": "admin"},
+        )
+        return _response(result)
+    except KeyError as exc:
+        return _failure(str(exc), 404)
+    except Exception as exc:
+        logger.warning(f"[BiliBot Extensions] page dispatch failed: {exc}")
+        return _failure("扩展页面暂时不可用", 502)
+
+
+async def handle_extension_action(plugin: Any):
+    try:
+        body = await request.json(default={})
+        if not isinstance(body, dict):
+            return _failure("扩展动作请求必须是 JSON 对象")
+        extension_id = str(body.get("extension_id", "") or "").strip()
+        action_id = str(body.get("action_id", "") or "").strip()
+        payload = body.get("payload") or {}
+        if not extension_id or not action_id or not isinstance(payload, dict):
+            return _failure("extension_id、action_id 和对象 payload 均为必填")
+        dispatcher = getattr(plugin, "_bilibot_extension_dispatcher", None)
+        if dispatcher is None:
+            return _failure("扩展 Host 尚未初始化", 503)
+        result = await dispatcher.dispatch(
+            extension_id,
+            f"action:{action_id}",
+            payload=payload,
+            actor={"source": "bilibot-webui", "role": "admin"},
+        )
+        return _response(result)
+    except KeyError as exc:
+        return _failure(str(exc), 404)
+    except Exception as exc:
+        logger.warning(f"[BiliBot Extensions] action dispatch failed: {exc}")
+        return _failure("扩展动作执行失败", 502)
+
+
+async def handle_extension_refresh(plugin: Any):
+    try:
+        dispatcher = getattr(plugin, "_bilibot_extension_dispatcher", None)
+        if dispatcher is None:
+            return _response([])
+        return _response(await dispatcher.list_extensions(), "扩展发现已刷新")
+    except Exception as exc:
+        logger.warning(f"[BiliBot Extensions] refresh failed: {exc}")
+        return _response([], "扩展刷新失败，主插件功能不受影响")

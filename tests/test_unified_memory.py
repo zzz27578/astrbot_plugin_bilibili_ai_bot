@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from core.layered_runtime import LayeredRuntime
@@ -47,6 +48,11 @@ def _load_memory_module(temp_dir):
     config.MOOD_FILE = str(Path(temp_dir) / "mood.json")
     config.SECURITY_LOG_FILE = str(Path(temp_dir) / "security.json")
     config.USER_PROFILE_FILE = str(Path(temp_dir) / "profiles.json")
+    config.WATCH_LOG_FILE = str(Path(temp_dir) / "watch_log.json")
+    config.COMMENTED_FILE = str(Path(temp_dir) / "commented_videos.json")
+    config.VIDEO_MEMORY_FILE = str(Path(temp_dir) / "video_memory.json")
+    config.EXTERNAL_MEMORY_FILE = str(Path(temp_dir) / "external_memory.json")
+    config.SEEN_VIDEOS_FILE = str(Path(temp_dir) / "seen_videos.json")
     sys.modules[config_name] = config
 
     module_name = f"{package_name}.memory"
@@ -211,6 +217,266 @@ class UnifiedMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("直播互动细节", private)
         self.assertIn("直播印象", live)
         self.assertNotIn("私信里的秘密", live)
+
+    async def test_single_delete_invalidates_derived_summary_and_vector_rows(self):
+        target = {
+            "rpid": "live-raw-1",
+            "text": "用户在直播里说过一条稍后应被删除的话",
+            "time": "2026-08-20 20:00",
+            "source": "bilibili_live",
+            "scope": "bili_live",
+            "thread_id": "live:room-1:session-1",
+            "user_id": "42",
+            "memory_type": "live",
+            "embedding": [0.1, 0.2],
+        }
+        derived = {
+            "rpid": "compressed-live-42",
+            "text": "[记忆压缩] 包含那条稍后应被删除的话",
+            "time": "2026-08-20 20:05",
+            "source": "bilibili_live",
+            "scope": "bili_live",
+            "thread_id": "compressed:bili_live",
+            "user_id": "42",
+            "memory_type": "user_summary",
+            "summary_kind": "user",
+            "derived_from_rpids": ["live-raw-1"],
+            "embedding": [0.2, 0.3],
+        }
+        unrelated = {
+            "rpid": "live-keep-99",
+            "text": "另一位用户的独立直播记忆",
+            "time": "2026-08-20 20:06",
+            "source": "bilibili_live",
+            "scope": "bili_live",
+            "thread_id": "live:room-1:session-1",
+            "user_id": "99",
+            "memory_type": "live",
+            "embedding": [0.3, 0.4],
+        }
+        Path(self.config.USER_PROFILE_FILE).write_text(
+            json.dumps(
+                {
+                    "42": {
+                        "live": {
+                            "memory_refs": [
+                                "live-raw-1",
+                                "compressed-live-42",
+                                "keep-ref",
+                            ]
+                        }
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bot = self.bot([target, derived, unrelated])
+        await bot._initialize_unified_memory()
+        self.assertEqual(
+            await self.layers.db.fetch_value(
+                "SELECT COUNT(*) FROM memory_vectors", default=0
+            ),
+            3,
+        )
+
+        report = await bot._delete_memory_by_rpid("live-raw-1")
+
+        self.assertTrue(report["found"])
+        self.assertEqual(report["deleted_count"], 2)
+        self.assertEqual(report["invalidated_summary_count"], 1)
+        self.assertEqual(report["profile_memory_refs_removed"], 2)
+        self.assertEqual(
+            {item["rpid"] for item in bot._memory}, {"live-keep-99"}
+        )
+        self.assertEqual(
+            {item["rpid"] for item in await self.layers.memories.load_legacy()},
+            {"live-keep-99"},
+        )
+        self.assertEqual(
+            await self.layers.db.fetch_value(
+                "SELECT COUNT(*) FROM memory_vectors", default=0
+            ),
+            1,
+        )
+        backup = json.loads(
+            Path(self.config.MEMORY_FILE).read_text(encoding="utf-8")
+        )
+        self.assertEqual({item["rpid"] for item in backup}, {"live-keep-99"})
+        profiles = json.loads(
+            Path(self.config.USER_PROFILE_FILE).read_text(encoding="utf-8")
+        )
+        self.assertEqual(profiles["42"]["live"]["memory_refs"], ["keep-ref"])
+
+    async def test_single_delete_conservatively_invalidates_legacy_summary(self):
+        target = {
+            "rpid": "comment-raw-1",
+            "text": "旧评论原文",
+            "source": "bilibili",
+            "scope": "bili_comment",
+            "thread_id": "thread-1",
+            "oid": "100",
+            "user_id": "42",
+            "memory_type": "chat",
+        }
+        legacy_summary = {
+            "rpid": "thread_compressed_old",
+            "text": "[评论线总结] 旧评论原文的摘要",
+            "source": "bilibili",
+            "scope": "bili_comment",
+            "thread_id": "thread-1",
+            "oid": "100",
+            "user_id": "42",
+            "memory_type": "chat",
+        }
+        independent = {
+            "rpid": "comment-keep-2",
+            "text": "同一视频下另一条独立评论线",
+            "source": "bilibili",
+            "scope": "bili_comment",
+            "thread_id": "thread-2",
+            "oid": "200",
+            "user_id": "99",
+            "memory_type": "chat",
+        }
+        other_thread_summary = {
+            "rpid": "thread_compressed_other",
+            "text": "[评论线总结] 同一用户在其他评论线的独立摘要",
+            "source": "bilibili",
+            "scope": "bili_comment",
+            "thread_id": "thread-3",
+            "oid": "300",
+            "user_id": "42",
+            "memory_type": "chat",
+        }
+        bot = self.bot(
+            [target, legacy_summary, independent, other_thread_summary]
+        )
+        await bot._initialize_unified_memory()
+
+        report = await bot._delete_memory_by_rpid("comment-raw-1")
+
+        self.assertEqual(
+            set(report["removed_rpids"]),
+            {"comment-raw-1", "thread_compressed_old"},
+        )
+        self.assertEqual(
+            {item["rpid"] for item in bot._memory},
+            {"comment-keep-2", "thread_compressed_other"},
+        )
+
+    async def test_single_delete_missing_id_is_a_noop(self):
+        bot = self.bot(
+            [{"rpid": "keep", "text": "保留", "source": "bilibili"}]
+        )
+        await bot._initialize_unified_memory()
+
+        report = await bot._delete_memory_by_rpid("missing")
+
+        self.assertFalse(report["found"])
+        self.assertEqual({item["rpid"] for item in bot._memory}, {"keep"})
+
+    def test_derived_memory_id_is_stable_and_order_independent(self):
+        bot = self.bot([])
+        first = bot._derived_memory_id(
+            "compressed", [{"rpid": "a"}, {"rpid": "b"}]
+        )
+        second = bot._derived_memory_id(
+            "compressed", [{"rpid": "b"}, {"rpid": "a"}]
+        )
+        self.assertEqual(first, second)
+        self.assertTrue(first.startswith("compressed_"))
+
+    def test_video_memory_recall_weight_decays_by_age(self):
+        bot = self.bot([])
+        bot.config = {
+            "VIDEO_MEMORY_DETAIL_DAYS": 15,
+            "VIDEO_MEMORY_FADE_DAYS": 90,
+        }
+        now = datetime.now()
+        detail = bot._prepare_memory_entry(
+            {
+                "rpid": "detail-video",
+                "text": "近期视频",
+                "memory_type": "video",
+                "time": (now - timedelta(days=10)).strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+        long_term = bot._prepare_memory_entry(
+            {
+                "rpid": "long-video",
+                "text": "较早视频",
+                "memory_type": "video",
+                "time": (now - timedelta(days=20)).strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+        faded = bot._prepare_memory_entry(
+            {
+                "rpid": "faded-video",
+                "text": "很久以前的视频",
+                "memory_type": "video",
+                "time": (now - timedelta(days=100)).strftime("%Y-%m-%d %H:%M"),
+            }
+        )
+
+        self.assertEqual(bot._memory_recall_weight(detail), 1.0)
+        self.assertEqual(bot._memory_recall_weight(long_term), 0.68)
+        self.assertEqual(bot._memory_recall_weight(faded), 0.52)
+
+    async def test_seen_video_migration_survives_capped_activity_log(self):
+        entries = [
+            {
+                "bvid": f"BV{index:010d}",
+                "title": f"视频{index}",
+                "time": "2026-01-01 12:00",
+            }
+            for index in range(205)
+        ]
+        bot = self.bot([])
+        bot._save_json(self.config.WATCH_LOG_FILE, entries)
+
+        self.assertEqual(await bot._initialize_seen_videos(), 205)
+        bot._save_json(self.config.WATCH_LOG_FILE, entries[-200:])
+
+        seen = await bot._seen_video_bvids()
+        self.assertIn("BV0000000000", seen)
+        self.assertEqual(await self.layers.seen_videos.count(), 205)
+
+    async def test_video_experience_is_vectorized_and_recalled(self):
+        bot = self.bot([])
+
+        async def embedding(_text):
+            return [1.0, 0.0]
+
+        bot._get_embedding = embedding
+        bot._cosine_similarity = lambda left, right: sum(
+            a * b for a, b in zip(left, right)
+        )
+        await bot._save_self_memory_record(
+            "proactive_watch",
+            "Bot看了《守塔人》，喜欢克制的人物关系，想继续找人物解析。",
+            memory_type="video",
+            extra={
+                "bvid": "BV1VECTOR001",
+                "video_title": "守塔人",
+                "owner_mid": "100",
+                "owner_name": "测试UP",
+                "score": 8.6,
+                "score_reason": "喜欢克制叙事",
+                "preference_signals": [{
+                    "type": "work", "value": "守塔人", "polarity": "like",
+                    "strength": 0.8, "evidence": "人物关系",
+                }],
+                "search_keywords": ["守塔人 人物解析"],
+            },
+        )
+
+        self.assertEqual(bot._memory[0]["embedding"], [1.0, 0.0])
+        recalled = await bot._search_memories(
+            "守塔人角色关系", memory_types={"video"}, score_threshold=0.5
+        )
+        self.assertEqual(len(recalled), 1)
+        self.assertIn("守塔人", recalled[0])
 
 
 if __name__ == "__main__":

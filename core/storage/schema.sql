@@ -114,6 +114,79 @@ CREATE TABLE IF NOT EXISTS legacy_memory_map (
 );
 CREATE INDEX IF NOT EXISTS idx_legacy_memory_key ON legacy_memory_map (legacy_key);
 
+-- 永久视频去重账本。它只回答“是否看过”，不保存视频正文或向量；
+-- 详细内容可以淡忘，但此表不按容量或时间裁剪。
+CREATE TABLE IF NOT EXISTS seen_videos (
+    bvid            TEXT PRIMARY KEY,
+    first_seen_at   REAL NOT NULL,
+    last_related_at REAL NOT NULL,
+    watch_count     INTEGER NOT NULL DEFAULT 1,
+    title           TEXT NOT NULL DEFAULT '',
+    owner_mid       TEXT NOT NULL DEFAULT '',
+    owner_name      TEXT NOT NULL DEFAULT '',
+    tname           TEXT NOT NULL DEFAULT '',
+    last_source     TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_seen_videos_last ON seen_videos (last_related_at);
+
+-- 对话反馈候选：只保存经过严格输出协议验证的短结论，并且必须在回复
+-- 确认发送成功后写入。候选不会直接修改人格，由日报/周报后续聚合。
+CREATE TABLE IF NOT EXISTS feedback_candidates (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key        TEXT NOT NULL UNIQUE,
+    actor_id         TEXT NOT NULL DEFAULT '',
+    actor_name       TEXT NOT NULL DEFAULT '',
+    scope            TEXT NOT NULL,
+    feedback_type    TEXT NOT NULL,
+    topic            TEXT NOT NULL DEFAULT '',
+    event_summary    TEXT NOT NULL DEFAULT '',
+    possible_mistake TEXT NOT NULL DEFAULT '',
+    next_time        TEXT NOT NULL DEFAULT '',
+    confidence       REAL NOT NULL DEFAULT 0,
+    relation_weight  REAL NOT NULL DEFAULT 1,
+    is_owner         INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'candidate',
+    created_at       REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback_candidates (created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_topic ON feedback_candidates (feedback_type, topic);
+
+-- 视频评价提取出的可验证偏好证据。evidence_key 由观看记录与具体信号共同
+-- 生成，确保日报/周报重复汇总时不会把同一证据累计多次。
+CREATE TABLE IF NOT EXISTS preference_evidence (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    evidence_key   TEXT NOT NULL UNIQUE,
+    preference_key TEXT NOT NULL,
+    signal_type    TEXT NOT NULL,
+    value          TEXT NOT NULL,
+    polarity       TEXT NOT NULL,
+    strength       REAL NOT NULL DEFAULT 0,
+    source_ref     TEXT NOT NULL DEFAULT '',
+    occurred_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_preference_evidence_key
+    ON preference_evidence (preference_key, occurred_at);
+
+-- 从证据推导出的当前偏好状态。候选/近期/稳定只是生命周期状态，不会改写
+-- 核心人设；每周可增强、保留、减弱或删除。
+CREATE TABLE IF NOT EXISTS preferences (
+    preference_key TEXT PRIMARY KEY,
+    signal_type    TEXT NOT NULL,
+    value          TEXT NOT NULL,
+    polarity       TEXT NOT NULL,
+    stage          TEXT NOT NULL,
+    score          REAL NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    active_weeks   INTEGER NOT NULL DEFAULT 0,
+    first_seen     REAL NOT NULL,
+    last_seen      REAL NOT NULL,
+    lifecycle_action TEXT NOT NULL DEFAULT 'retained',
+    updated_at     REAL NOT NULL,
+    expires_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_preferences_stage
+    ON preferences (stage, score, last_seen);
+
 -- 用户群像：小体积结构化，增量更新（只改动变化字段，不重写全量摘要）。
 CREATE TABLE IF NOT EXISTS profiles (
     actor_id     TEXT PRIMARY KEY,
